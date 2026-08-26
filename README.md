@@ -436,21 +436,8 @@ Recommended production deployment model:
 
 ## Contact
 
-### Business Contact
-
-- [txq@zhinian-ai.com](mailto:txq@zhinian-ai.com)
-
-### Discord
-
-- `https://discord.gg/uQRzb53R`
-
-### QQ Group
-
-- `147594586`
-
-### QQ Group Link
-
-- `https://qm.qq.com/q/jGGRuz368w`
+- Email: [txq@zhinian-ai.com](mailto:txq@zhinian-ai.com)
+- QQ: `147594586`
 
 ## License
 
