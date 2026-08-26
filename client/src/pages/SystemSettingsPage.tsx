@@ -90,6 +90,7 @@ export function SystemSettingsPage() {
   const [apiSyncStatus, setApiSyncStatus] = useState('未连接')
   const lanDiscoveryMode = 'miot_lan' as const
   const [lanSubnet, setLanSubnet] = useState('')
+  const [lanSubnetsDetected, setLanSubnetsDetected] = useState<string[]>([])
   const [lanVendorRemoteApi, setLanVendorRemoteApi] = useState(true)
   const [lanScanning, setLanScanning] = useState(false)
   const [lanDiscoveryStatus, setLanDiscoveryStatus] = useState('未开始识别')
@@ -276,6 +277,28 @@ export function SystemSettingsPage() {
   useEffect(() => {
     setExtraVerificationPending(!!xiaomiExtraStatus?.auth?.needsVerification && !xiaomiExtraStatus?.loggedIn)
   }, [xiaomiExtraStatus?.auth?.needsVerification, xiaomiExtraStatus?.loggedIn])
+
+  useEffect(() => {
+    let cancelled = false
+    const detect = async () => {
+      try {
+        const res = await system.detectLanSubnets()
+        if (cancelled) return
+        const subnets = Array.isArray(res?.subnets) ? res.subnets : []
+        setLanSubnetsDetected(subnets)
+        // 只在用户尚未手动填写时，用自动探测结果预填（198 号段等现场网段）
+        if (subnets.length > 0) {
+          setLanSubnet((prev) => (prev.trim() ? prev : subnets.join(',')))
+        }
+      } catch {
+        // 静默失败，用户仍可手动填写
+      }
+    }
+    detect()
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   useEffect(() => {
     if (!verificationPending) return
@@ -2143,6 +2166,18 @@ export function SystemSettingsPage() {
                         onChange={(e) => setLanSubnet(e.target.value)}
                         disabled={lanScanning}
                       />
+                      {lanSubnetsDetected.length > 0 && (
+                        <p className="text-[11px] leading-snug text-muted-foreground">
+                          已自动探测到本机所在网段：
+                          <button
+                            type="button"
+                            className="ml-1 font-mono text-primary underline-offset-2 hover:underline"
+                            onClick={() => setLanSubnet(lanSubnetsDetected.join(','))}
+                          >
+                            {lanSubnetsDetected.join(', ')}
+                          </button>
+                        </p>
+                      )}
                     </div>
                     <div className="flex items-center gap-2 pb-2">
                       <Switch

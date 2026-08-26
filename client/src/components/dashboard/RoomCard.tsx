@@ -1,5 +1,5 @@
 import { useState, type MouseEvent, useEffect, useMemo, useRef } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { Card, CardContent } from '../ui/card';
@@ -38,9 +38,9 @@ import {
   Eye,
   EyeOff,
   MicOff,
-  ShieldAlert,
   Monitor,
   ExternalLink,
+  WifiOff,
 } from 'lucide-react';
 import {
   ROOM_STATUS_COLORS,
@@ -62,6 +62,7 @@ import {
   formatBytes,
   hasMeaningfulValue,
   progressColorForPercent,
+  inferEndpointTypeLabel,
 } from '../../lib/format';
 import { getRoomStatusCardToneClass } from '../../lib/status-maps';
 import { energy, system } from '../../lib/api';
@@ -103,6 +104,7 @@ function getToggleButtonClass(checked: boolean, disabled?: boolean) {
 
 export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const role = useAuthStore((state) => state.role);
   const canControl = role === UserRole.ADMIN || role === UserRole.BOSS;
@@ -162,7 +164,12 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
   } | null>(null);
   const hlsVideoRef = useRef<HTMLVideoElement | null>(null);
   const hlsInstanceRef = useRef<any>(null);
+  const cardVideoRef = useRef<HTMLVideoElement | null>(null);
+  const cardHlsInstanceRef = useRef<any>(null);
+  const [cardStream, setCardStream] = useState<{ hlsUrl?: string } | null>(null);
   const [ptzLoading, setPtzLoading] = useState(false);
+  const [recordingActive, setRecordingActive] = useState(false);
+  const [recordingLoading, setRecordingLoading] = useState(false);
   const [euCameraLoginExpanded, setEuCameraLoginExpanded] = useState(false);
   const { credentials: euCameraRemember, persist: persistEuCameraRemember, clear: clearEuCameraRemember } =
     useXiaomiRememberedCredentials('camera')
@@ -193,6 +200,13 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
   void euCameraOtpLoading;
   const [otpResendCountdown, setOtpResendCountdown] = useState<number>(0);
   const [networkDetailOpen, setNetworkDetailOpen] = useState(false);
+  const [deviceDetailOpen, setDeviceDetailOpen] = useState(false);
+  const [deviceCategoryDraft, setDeviceCategoryDraft] = useState<string>('');
+  const [deviceCategorySaving, setDeviceCategorySaving] = useState(false);
+  const [deviceNameDraft, setDeviceNameDraft] = useState('');
+  const [deviceNameSaving, setDeviceNameSaving] = useState(false);
+  const [deviceDeleting, setDeviceDeleting] = useState(false);
+  const [deviceDeleteConfirming, setDeviceDeleteConfirming] = useState(false);
   const [adapterKind, setAdapterKind] = useState<'huawei_cpe' | 'nokia_beacon' | null>(null);
   const [adapterBaseUrl, setAdapterBaseUrl] = useState('');
   const [adapterUsername, setAdapterUsername] = useState('admin');
@@ -397,7 +411,92 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
   const primaryCategoryLabel = DEVICE_CATEGORY_LABEL[primaryCategory] ?? '其他智能设备';
   const multiCategory = Object.values(categoryCounts).filter((n) => n > 0).length >= 2;
 
+  // 录像回放页快捷入口：通过 ?camera=<did> 深链直接打开摄像头详情
+  const deepLinkCameraDid = searchParams.get('camera');
+  useEffect(() => {
+    if (
+      deepLinkCameraDid &&
+      primaryCategory === DeviceCategory.CAMERA &&
+      deviceDid === deepLinkCameraDid
+    ) {
+      setCameraDetailOpen(true);
+      const next = new URLSearchParams(searchParams);
+      next.delete('camera');
+      setSearchParams(next, { replace: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deepLinkCameraDid, primaryCategory, deviceDid]);
+
   const cardToneClassName = getRoomStatusCardToneClass(room.status);
+
+  const openDeviceDetail = () => {
+    if (!deviceDid) {
+      toast.warning('设备信息不存在');
+      return;
+    }
+    setDeviceCategoryDraft(String((firstDevice as any)?.category ?? primaryCategory ?? 'other'));
+    setDeviceNameDraft(String(room.title ?? (firstDevice as any)?.name ?? ''));
+    setDeviceDeleteConfirming(false);
+    setDeviceDetailOpen(true);
+  };
+
+  const handleSaveDeviceCategory = async () => {
+    if (!deviceDid || !canControl) return;
+    if (!Object.values(DeviceCategory).includes(deviceCategoryDraft as DeviceCategory)) {
+      toast.error('无效的设备分类');
+      return;
+    }
+    try {
+      setDeviceCategorySaving(true);
+      await system.updateDeviceCategory(deviceDid, deviceCategoryDraft);
+      await queryClient.invalidateQueries({ queryKey: ['dashboard'] });
+      setDeviceDetailOpen(false);
+      toast.success('设备分类已更新');
+    } catch (error: any) {
+      toast.error(error?.response?.data?.message || error?.message || '更新设备分类失败');
+    } finally {
+      setDeviceCategorySaving(false);
+    }
+  };
+
+  const handleSaveDeviceName = async () => {
+    if (!deviceDid || !canRename) return;
+    const trimmed = (deviceNameDraft ?? '').trim();
+    if (!trimmed) {
+      toast.error('设备名称不能为空');
+      return;
+    }
+    try {
+      setDeviceNameSaving(true);
+      await system.renameDevice(deviceDid, trimmed);
+      await queryClient.invalidateQueries({ queryKey: ['dashboard'] });
+      toast.success('设备名称已更新');
+    } catch {
+      toast.error('修改设备名称失败');
+    } finally {
+      setDeviceNameSaving(false);
+    }
+  };
+
+  const handleDeleteDevice = async () => {
+    if (!deviceDid || !canControl) return;
+    if (!deviceDeleteConfirming) {
+      setDeviceDeleteConfirming(true);
+      return;
+    }
+    try {
+      setDeviceDeleting(true);
+      await system.deleteDevice(deviceDid);
+      await queryClient.invalidateQueries({ queryKey: ['dashboard'] });
+      setDeviceDetailOpen(false);
+      setDeviceDeleteConfirming(false);
+      toast.success('设备已删除');
+    } catch (error: any) {
+      toast.error(error?.response?.data?.message || error?.message || '删除设备失败');
+    } finally {
+      setDeviceDeleting(false);
+    }
+  };
 
   const handleOpenDetail = () => {
     if (editingName) return;
@@ -411,17 +510,15 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
     }
     if (room.roomId) {
       navigate(`/rooms/${room.roomId}`);
+      return;
     }
+    openDeviceDetail();
   };
 
   const cameraSnapshotThumbUrl = useMemo(() => {
     if (primaryCategory !== DeviceCategory.CAMERA || !deviceDid) return '';
     return system.getDeviceSnapshotUrl(deviceDid, { fresh: false });
   }, [primaryCategory, deviceDid, cameraSnapshotBump]);
-  const cameraSnapshotLargeUrl = useMemo(() => {
-    if (primaryCategory !== DeviceCategory.CAMERA || !deviceDid) return '';
-    return system.getDeviceSnapshotUrl(deviceDid, { fresh: true });
-  }, [primaryCategory, deviceDid, cameraSnapshotBump, cameraDetailOpen]);
 
   useEffect(() => {
     if (primaryCategory !== DeviceCategory.CAMERA) return;
@@ -438,6 +535,81 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
       clearTimeout(timer);
     };
   }, [primaryCategory, deviceDid]);
+
+  // 卡片主画面：自动拉取 HLS 真实视频流（米家摄像头走云端 m3u8，绕开 logo 快照问题）
+  useEffect(() => {
+    if (primaryCategory !== DeviceCategory.CAMERA || !deviceDid) {
+      setCardStream(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await system.getCameraStream(deviceDid);
+        if (cancelled) return;
+        if (res.hlsUrl) setCardStream({ hlsUrl: res.hlsUrl });
+      } catch {
+        // 拉流失败时保持快照兜底，不打断渲染
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [primaryCategory, deviceDid]);
+
+  useEffect(() => {
+    const url = cardStream?.hlsUrl;
+    const videoEl = cardVideoRef.current;
+    if (!url || !videoEl) return;
+    let destroyed = false;
+    const run = async () => {
+      const canNative =
+        typeof videoEl.canPlayType === 'function' &&
+        videoEl.canPlayType('application/vnd.apple.mpegurl');
+      if (canNative) {
+        videoEl.src = url;
+        try { await videoEl.play(); } catch {}
+        return;
+      }
+      try {
+        const Hls = (await import('hls.js')).default;
+        if (!Hls || !Hls.isSupported()) return;
+        const hls = new Hls({
+          lowLatencyMode: true,
+          enableWorker: true,
+          liveSyncDurationCount: 1,
+          liveMaxLatencyDurationCount: 2,
+          maxBufferLength: 3,
+          maxMaxBufferLength: 5,
+          backBufferLength: 3,
+          maxLiveSyncPlaybackRate: 1.5,
+          initialLiveManifestSize: 1,
+        });
+        if (destroyed) return;
+        cardHlsInstanceRef.current = hls;
+        hls.loadSource(url);
+        hls.attachMedia(videoEl);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          videoEl.play().catch(() => {});
+        });
+      } catch {
+        // 忽略，保留快照兜底
+      }
+    };
+    run();
+    return () => {
+      destroyed = true;
+      if (cardHlsInstanceRef.current) {
+        try { cardHlsInstanceRef.current.destroy(); } catch {}
+        cardHlsInstanceRef.current = null;
+      }
+      try {
+        videoEl.pause();
+        videoEl.removeAttribute('src');
+        videoEl.load();
+      } catch {}
+    };
+  }, [cardStream?.hlsUrl]);
 
   const handleStartRename = (event: MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
@@ -695,7 +867,7 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
       setOpenStreamLoading(true);
       setStartStreamError('');
       const res = await system.getCameraStream(deviceDid);
-      if (!res.ok) {
+      if (!res.hlsUrl) {
         setStartStreamError(res.errorMessage || '开启视频流失败');
         return;
       }
@@ -707,8 +879,8 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
         startedAt: res.startedAt,
         ffmpegAvailable: res.ffmpegAvailable,
       });
-      if (res.proxyMode && res.proxyMode !== 'ffmpeg-hls') {
-        setStartStreamError(`当前代理模式：${res.proxyMode}，需单独配置`);
+      if (res.proxyMode === 'none') {
+        setStartStreamError(res.errorMessage || '视频流代理未就绪');
       }
       if (!res.hlsUrl && res.ffmpegAvailable === false) {
         setStartStreamError('服务器未检测到 ffmpeg，无法生成 HLS 切片。请安装 ffmpeg 后重试。');
@@ -719,6 +891,15 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
       setOpenStreamLoading(false);
     }
   };
+
+  // 详情页打开时自动拉流（与卡片共用同一条 getCameraStream 通道，不再走快照/logo 兜底）
+  useEffect(() => {
+    if (!cameraDetailOpen) return;
+    if (cameraViewTab !== 'live') return;
+    if (currentStream?.hlsUrl || openStreamLoading) return;
+    startCameraStream();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cameraDetailOpen, cameraViewTab]);
 
   useEffect(() => {
     if (!cameraDetailOpen) return;
@@ -739,7 +920,17 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
           setStartStreamError('当前浏览器不支持 HLS 播放');
           return;
         }
-        const hls = new Hls({ lowLatencyMode: true, enableWorker: true });
+        const hls = new Hls({
+          lowLatencyMode: true,
+          enableWorker: true,
+          liveSyncDurationCount: 1,
+          liveMaxLatencyDurationCount: 2,
+          maxBufferLength: 3,
+          maxMaxBufferLength: 5,
+          backBufferLength: 3,
+          maxLiveSyncPlaybackRate: 1.5,
+          initialLiveManifestSize: 1,
+        });
         if (destroyed) return;
         hlsInstanceRef.current = hls;
         hls.loadSource(hlsUrl);
@@ -790,17 +981,64 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
     return () => clearInterval(timer);
   }, [otpResendCountdown]);
 
-  const handleCameraPTZ = async (dir: 'left' | 'right' | 'up' | 'down' | 'stop') => {
+  const handleCameraCalibrate = async () => {
     if (!deviceDid || !canControl) return;
     try {
       setPtzLoading(true);
-      await system.controlCameraPTZ(deviceDid, dir, 50);
+      await system.controlCameraPTZ(deviceDid, 'calibrate', 0);
+      toast.success('已发送云台回中指令');
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : '云台控制失败');
+      toast.error(error instanceof Error ? error.message : '云台回中失败');
     } finally {
       setPtzLoading(false);
     }
   };
+
+  const refreshRecordings = async () => {
+    if (!deviceDid) return;
+    try {
+      const status = await system.getCameraRecordingStatus(deviceDid);
+      setRecordingActive(status.recording);
+    } catch {
+      /* noop */
+    }
+  };
+
+  const handleToggleRecording = async () => {
+    if (!deviceDid || !canControl) return;
+    try {
+      setRecordingLoading(true);
+      if (recordingActive) {
+        await system.stopCameraRecording(deviceDid);
+        setRecordingActive(false);
+        toast.success('已停止录制');
+      } else {
+        const res = await system.startCameraRecording(deviceDid);
+        if (res.recording) {
+          setRecordingActive(true);
+          toast.success('已开启录制');
+        } else {
+          toast.error(res.errorMessage || '开启录制失败');
+        }
+      }
+      await refreshRecordings();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '录制操作失败');
+    } finally {
+      setRecordingLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!cameraDetailOpen) return;
+    refreshRecordings();
+    // 详情打开期间轮询刷新，保证录制按钮状态实时同步
+    const timer = setInterval(() => {
+      refreshRecordings();
+    }, 3000);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cameraDetailOpen]);
 
   const handleTakeEvidenceSnapshot = async () => {
     if (!deviceDid) return;
@@ -834,10 +1072,10 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
         try { document.body.removeChild(a); } catch {}
         try { URL.revokeObjectURL(url); } catch {}
       }, 500);
-      toast.success(`已保存临时证据截图：${filename}`);
+      toast.success(`已保存截图：${filename}`);
       setCameraSnapshotBump((prev) => prev + 1);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : '临时截图失败');
+      toast.error(error instanceof Error ? error.message : '截图失败');
     } finally {
       setTakeSnapshotLoading(false);
     }
@@ -1247,25 +1485,45 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
                 style={{ minHeight: '280px' }}
               >
                 <div className="absolute inset-0">
-                  {cameraSnapshotThumbUrl ? (
+                  {cardStream?.hlsUrl ? (
+                    <video
+                      ref={cardVideoRef}
+                      autoPlay
+                      muted
+                      playsInline
+                      className="h-full w-full object-contain"
+                      style={{ background: '#000' }}
+                    />
+                  ) : cameraSnapshotThumbUrl ? (
                     <img
                       key={cameraSnapshotThumbUrl + '_' + snapshotThumbReloadRef.current}
                       src={cameraSnapshotThumbUrl}
                       alt={room.title + ' 实时快照'}
-                      className="h-full w-full object-cover"
+                      className="h-full w-full object-contain"
                       onError={() => {}}
                     />
                   ) : (
                     <div className="flex h-full w-full flex-col items-center justify-center gap-1 px-2 text-center text-[10px] leading-4 text-slate-400">
-                      <span>暂无可渲染的快照来源</span>
+                      <span>暂无可渲染的画面</span>
                       <span className="text-slate-500">点右上角查看详情后再配置接入</span>
                     </div>
                   )}
                 </div>
-                <div className="pointer-events-none absolute left-1 top-1 inline-flex items-center gap-1 rounded bg-black/55 px-1.5 py-0.5 text-[10px] font-medium text-rose-100">
-                  <span className="h-1.5 w-1.5 rounded-full bg-rose-500 animate-pulse" />
-                  LIVE
-                </div>
+                {room.deviceOnline ? (
+                  <div className="pointer-events-none absolute left-1 top-1 inline-flex items-center gap-1 rounded bg-black/55 px-1.5 py-0.5 text-[10px] font-medium text-emerald-100">
+                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                    LIVE
+                  </div>
+                ) : (
+                  <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-2 bg-slate-900/35">
+                    <span className="flex h-14 w-14 items-center justify-center rounded-full bg-black/45">
+                      <WifiOff className="h-7 w-7 text-white/75" />
+                    </span>
+                    <span className="rounded bg-black/50 px-2 py-0.5 text-[11px] font-medium text-white/80">
+                      离线 / 连接断开
+                    </span>
+                  </div>
+                )}
                 <div className="pointer-events-auto absolute right-1.5 top-1.5 inline-flex gap-1">
                   <button
                     type="button"
@@ -1294,40 +1552,24 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
               </div>
               {(() => {
                 const cam = (firstDevice as any)?.camera ?? null;
-                const hasAudio = cam?.hasAudio === true || cam?.audioEnabled === true;
-                const hasMotion = typeof cam?.lastMotionAt === 'string' || cam?.motionEnabled === true;
-                const hasNight = cam?.hasNightVision === true || cam?.nightVision === true || cam?.nightMode === true;
-                const hasRecording = cam?.recordingEnabled === true || cam?.storageEnabled === true || cam?.sdCard === true;
-                const tone = (ok: boolean) =>
-                  ok
-                    ? 'text-emerald-600 dark:text-emerald-400 border-emerald-400/50 bg-emerald-50/60 dark:bg-emerald-950/30'
-                    : 'text-rose-600 dark:text-rose-400 border-rose-400/50 bg-rose-50/60 dark:bg-rose-950/30';
+                const caps = [
+                  { key: 'audio', label: '录音', show: cam?.hasAudio === true, Icon: Mic },
+                  { key: 'motion', label: '移动侦测', show: cam?.hasMotion === true || typeof cam?.lastMotionAt === 'string', Icon: BellRing },
+                  { key: 'night', label: '夜视', show: cam?.hasNightVision === true, Icon: Moon },
+                  { key: 'recording', label: '录像存储', show: cam?.hasRecording === true, Icon: HardDrive },
+                ].filter((c) => c.show);
+                if (caps.length === 0) return null;
                 return (
-                  <div className="w-full grid grid-cols-4 gap-1">
-                    <div className="min-w-0">
-                      <div className={`inline-flex w-full items-center justify-center gap-1 rounded-md border px-2 py-1 text-[10.5px] ${tone(hasAudio)}`}>
-                        <Mic className="h-3 w-3 shrink-0" />
-                        <span className="truncate">录音</span>
+                  <div className="w-full flex flex-wrap gap-1">
+                    {caps.map(({ key, label, Icon }) => (
+                      <div
+                        key={key}
+                        className="inline-flex items-center gap-1 rounded-md border border-emerald-400/50 bg-emerald-50/60 px-2 py-1 text-[10.5px] text-emerald-600 dark:border-emerald-400/50 dark:bg-emerald-950/30 dark:text-emerald-400"
+                      >
+                        <Icon className="h-3 w-3 shrink-0" />
+                        <span className="truncate">{label}</span>
                       </div>
-                    </div>
-                    <div className="min-w-0">
-                      <div className={`inline-flex w-full items-center justify-center gap-1 rounded-md border px-2 py-1 text-[10.5px] ${tone(hasMotion)}`}>
-                        <BellRing className="h-3 w-3 shrink-0" />
-                        <span className="truncate">移动侦测</span>
-                      </div>
-                    </div>
-                    <div className="min-w-0">
-                      <div className={`inline-flex w-full items-center justify-center gap-1 rounded-md border px-2 py-1 text-[10.5px] ${tone(hasNight)}`}>
-                        <Moon className="h-3 w-3 shrink-0" />
-                        <span className="truncate">夜视</span>
-                      </div>
-                    </div>
-                    <div className="min-w-0">
-                      <div className={`inline-flex w-full items-center justify-center gap-1 rounded-md border px-2 py-1 text-[10.5px] ${tone(hasRecording)}`}>
-                        <HardDrive className="h-3 w-3 shrink-0" />
-                        <span className="truncate">录像存储</span>
-                      </div>
-                    </div>
+                    ))}
                   </div>
                 );
               })()}
@@ -1706,26 +1948,6 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
               {primaryCategoryLabel} {Object.values(categoryCounts).reduce((a, b) => a + b, 0) || '无'}
             </Badge>
           ) : null}
-          {primaryCategory !== DeviceCategory.CAMERA && room.deviceOnline ? (
-            <Badge variant="success" className="text-[10px]">
-              {typeof room.deviceOnline === 'number' && isPublicFacility
-                ? `在线 ${room.deviceOnline} 台`
-                : '设备在线'}
-            </Badge>
-          ) : primaryCategory !== DeviceCategory.CAMERA && !room.deviceOnline ? (
-            <TooltipProvider delayDuration={150}>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Badge variant="destructive" className="cursor-help text-[10px]">
-                    设备离线
-                  </Badge>
-                </TooltipTrigger>
-                <TooltipContent className="max-w-[260px] text-xs leading-5">
-                  设备已离线，请检查上一级控开及总电源。
-                </TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
-          ) : null}
           {cooldownActive ? (
             <Badge variant="outline" className="text-[10px]">
               {cooldownLabel}
@@ -1789,11 +2011,7 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
                     计费
                   </Button>
                 </div>
-              ) : (
-                <Badge variant={room.deviceOnline ? 'success' : 'destructive'} className="text-[10px]">
-                  {room.deviceOnline ? '设备在线' : '设备离线'}
-                </Badge>
-              )}
+              ) : null}
             </div>
           ) : null}
           <div className="flex flex-wrap gap-2">
@@ -1925,11 +2143,104 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
                   <Settings className="mr-1 h-3.5 w-3.5" /> 设备设置
                 </Button>
               </>
+            ) : (primaryCategory === DeviceCategory.OTHER || (!room.roomId && !isPublicFacility)) ? (
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-9 min-w-0 flex-1 basis-[120px] text-[clamp(0.72rem,0.95vw,0.78rem)]"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  openDeviceDetail();
+                }}
+              >
+                <Settings className="mr-1 h-3.5 w-3.5" /> 查看 / 分类
+              </Button>
             ) : null}
           </div>
         </div>
       </CardContent>
     </Card>
+
+    <Dialog open={deviceDetailOpen} onOpenChange={setDeviceDetailOpen}>
+      <DialogContent onClick={(event) => event.stopPropagation()}>
+        <DialogHeader>
+          <DialogTitle>{room.title || '设备详情'}</DialogTitle>
+          <DialogDescription>未分类设备：可查看信息、手动归类或重命名。</DialogDescription>
+        </DialogHeader>
+        <div className="space-y-3">
+          <div className="rounded-md bg-muted/40 p-3 text-xs leading-5">
+            {(() => {
+              const any = firstDevice as any;
+              const rows: Array<[string, string]> = [
+                ['DID', String(deviceDid ?? '--')],
+                ['名称', String(any?.name ?? room.title ?? '--')],
+                ['类型', inferEndpointTypeLabel({
+                  name: any?.name ?? null,
+                  hostname: any?.hostname ?? any?.hostName ?? null,
+                  vendor: any?.vendorName ?? any?.vendor ?? any?.manufacturer ?? null,
+                  systemCategory: any?.category ?? null,
+                })],
+                ['型号', String(any?.model ?? any?.modelName ?? '--')],
+                ['厂商', String(any?.vendorName ?? any?.vendor ?? any?.manufacturer ?? '--')],
+                ['MAC', String(any?.mac ?? any?.macAddress ?? '--')],
+                ['IP', String(any?.ipAddress ?? any?.ip ?? '--')],
+                ['状态', any?.status === 'online' ? '在线' : any?.status === 'offline' ? '离线' : '未知'],
+              ];
+              return rows.map(([label, value]) => (
+                <div key={label} className="flex justify-between gap-3 border-b border-slate-200/60 py-1 last:border-0 dark:border-slate-700/50">
+                  <span className="shrink-0 text-muted-foreground">{label}</span>
+                  <span className="min-w-0 break-all text-right font-medium">{value}</span>
+                </div>
+              ));
+            })()}
+          </div>
+          <div className="space-y-2">
+            <Label>设备分类</Label>
+            <Select value={deviceCategoryDraft} onValueChange={setDeviceCategoryDraft} disabled={!canControl}>
+              <SelectTrigger className="w-full">
+                <SelectValue placeholder="选择分类" />
+              </SelectTrigger>
+              <SelectContent>
+                {(Object.values(DeviceCategory) as DeviceCategory[]).map((cat) => (
+                  <SelectItem key={cat} value={cat}>
+                    {DEVICE_CATEGORY_LABEL[cat] ?? cat}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-2">
+            <Label>设备名称</Label>
+            <Input
+              value={deviceNameDraft}
+              onChange={(event) => setDeviceNameDraft(event.target.value)}
+              placeholder="输入设备名称"
+              disabled={!canRename}
+              maxLength={32}
+            />
+          </div>
+        </div>
+        <DialogFooter>
+          <Button
+            variant="destructive"
+            onClick={handleDeleteDevice}
+            disabled={!canControl || deviceDeleting}
+            className="mr-auto"
+          >
+            {deviceDeleting ? '删除中...' : deviceDeleteConfirming ? '确认删除？' : '删除设备'}
+          </Button>
+          <Button variant="outline" onClick={() => setDeviceDetailOpen(false)} disabled={deviceCategorySaving || deviceNameSaving}>
+            取消
+          </Button>
+          <Button variant="outline" onClick={handleSaveDeviceName} disabled={!canRename || deviceNameSaving}>
+            {deviceNameSaving ? '保存中...' : '重命名'}
+          </Button>
+          <Button onClick={handleSaveDeviceCategory} disabled={!canControl || deviceCategorySaving}>
+            {deviceCategorySaving ? '保存中...' : '保存分类'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
 
     <Dialog
       open={cameraDetailOpen}
@@ -2102,40 +2413,24 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
           <div className="flex-1 overflow-y-auto space-y-2.5 px-4 py-3">
             {(() => {
               const cam = (firstDevice as any)?.camera ?? null;
-              const hasAudio = cam?.hasAudio === true || cam?.audioEnabled === true;
-              const hasMotion = typeof cam?.lastMotionAt === 'string' || cam?.motionEnabled === true;
-              const hasNight = cam?.hasNightVision === true || cam?.nightVision === true || cam?.nightMode === true;
-              const hasRecording = cam?.recordingEnabled === true || cam?.storageEnabled === true || cam?.sdCard === true;
-              const tone = (ok: boolean) =>
-                ok
-                  ? 'text-emerald-600 dark:text-emerald-400 border-emerald-400/50 bg-emerald-50/60 dark:bg-emerald-950/30'
-                  : 'text-rose-600 dark:text-rose-400 border-rose-400/50 bg-rose-50/60 dark:bg-rose-950/30';
+              const caps = [
+                { key: 'audio', label: '录音', show: cam?.hasAudio === true, Icon: Mic },
+                { key: 'motion', label: '移动侦测', show: cam?.hasMotion === true || typeof cam?.lastMotionAt === 'string', Icon: BellRing },
+                { key: 'night', label: '夜视', show: cam?.hasNightVision === true, Icon: Moon },
+                { key: 'recording', label: '录像存储', show: cam?.hasRecording === true, Icon: HardDrive },
+              ].filter((c) => c.show);
+              if (caps.length === 0) return null;
               return (
-                <div className="w-full grid grid-cols-2 md:grid-cols-4 gap-1">
-                  <div className="min-w-0">
-                    <div className={`inline-flex w-full items-center justify-center gap-1 rounded-md border px-2 py-1 text-[11px] ${tone(hasAudio)}`}>
-                      <Mic className="h-3.5 w-3.5 shrink-0" />
-                      <span className="truncate">录音</span>
+                <div className="w-full flex flex-wrap gap-1">
+                  {caps.map(({ key, label, Icon }) => (
+                    <div
+                      key={key}
+                      className="inline-flex items-center gap-1 rounded-md border border-emerald-400/50 bg-emerald-50/60 px-2 py-1 text-[11px] text-emerald-600 dark:border-emerald-400/50 dark:bg-emerald-950/30 dark:text-emerald-400"
+                    >
+                      <Icon className="h-3.5 w-3.5 shrink-0" />
+                      <span className="truncate">{label}</span>
                     </div>
-                  </div>
-                  <div className="min-w-0">
-                    <div className={`inline-flex w-full items-center justify-center gap-1 rounded-md border px-2 py-1 text-[11px] ${tone(hasMotion)}`}>
-                      <BellRing className="h-3.5 w-3.5 shrink-0" />
-                      <span className="truncate">移动侦测</span>
-                    </div>
-                  </div>
-                  <div className="min-w-0">
-                    <div className={`inline-flex w-full items-center justify-center gap-1 rounded-md border px-2 py-1 text-[11px] ${tone(hasNight)}`}>
-                      <Moon className="h-3.5 w-3.5 shrink-0" />
-                      <span className="truncate">夜视</span>
-                    </div>
-                  </div>
-                  <div className="min-w-0">
-                    <div className={`inline-flex w-full items-center justify-center gap-1 rounded-md border px-2 py-1 text-[11px] ${tone(hasRecording)}`}>
-                      <HardDrive className="h-3.5 w-3.5 shrink-0" />
-                      <span className="truncate">录像存储</span>
-                    </div>
-                  </div>
+                  ))}
                 </div>
               );
             })()}
@@ -2361,21 +2656,17 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
                     autoPlay
                     muted
                     playsInline
-                    controls
                     className="h-full w-full object-contain"
                     style={{ background: '#000' }}
                   />
-                ) : cameraSnapshotLargeUrl ? (
-                  <img
-                    key={cameraSnapshotLargeUrl}
-                    src={cameraSnapshotLargeUrl}
-                    alt={room.title + ' 实时快照'}
-                    className="h-full w-full object-contain"
-                    onError={() => {}}
-                  />
                 ) : (
                   <div className="flex w-full flex-col items-center justify-center gap-2 py-6 text-center text-xs leading-5">
-                    {startStreamError ? (
+                    {openStreamLoading ? (
+                      <div className="flex items-center gap-2 text-slate-400">
+                        <RefreshCw className="h-4 w-4 animate-spin" />
+                        正在拉取实时流…
+                      </div>
+                    ) : startStreamError ? (
                       <div className="rounded border border-red-500/40 bg-red-950/30 px-3 py-2 text-red-200 break-all max-w-[90%]">
                         {startStreamError}
                       </div>
@@ -2413,11 +2704,6 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
                     <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
                     LIVE · {currentStream.proxyMode || 'HLS'}
                     {typeof currentStream.processId === 'number' ? ` · pid ${currentStream.processId}` : ''}
-                  </div>
-                ) : cameraSnapshotLargeUrl ? (
-                  <div className="pointer-events-none absolute left-2 top-2 inline-flex items-center gap-1.5 rounded bg-black/60 px-2 py-1 text-[11px] font-medium text-rose-100">
-                    <span className="h-2 w-2 rounded-full bg-rose-500 animate-pulse" />
-                    LIVE · 快照 10s 刷新
                   </div>
                 ) : null}
               </div>
@@ -2540,14 +2826,23 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
               <div className="inline-flex flex-wrap items-center gap-1.5">
                 <Button
                   size="sm"
-                  variant="outline"
-                  className="h-7 rounded-md px-2 text-[11px]"
+                  variant="default"
+                  className={cn(
+                    'h-7 rounded-md px-2 text-[11px]',
+                    recordingActive ? 'bg-red-600 hover:bg-red-700' : 'bg-indigo-600 hover:bg-indigo-700',
+                  )}
+                  disabled={!canControl || !deviceDid || recordingLoading}
                   onClick={(event) => {
                     event.stopPropagation();
-                    setCameraSnapshotBump((prev) => prev + 1);
+                    void handleToggleRecording();
                   }}
                 >
-                  <RefreshCw className="mr-1 h-3.5 w-3.5" /> 刷新快照
+                  {recordingLoading ? (
+                    <RefreshCw className="mr-1 h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <HardDrive className="mr-1 h-3.5 w-3.5" />
+                  )}
+                  {recordingActive ? '停止录制' : '开始录制'}
                 </Button>
                 <Button
                   size="sm"
@@ -2564,13 +2859,17 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
                   ) : (
                     <Image className="mr-1 h-3.5 w-3.5" />
                   )}
-                  临时截图
+                  截图
                 </Button>
                 <Button
                   size="sm"
                   variant="outline"
                   className="h-7 rounded-md px-2 text-[11px]"
-                  onClick={startCameraStream}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setCameraSnapshotBump((prev) => prev + 1);
+                    void startCameraStream();
+                  }}
                   disabled={openStreamLoading}
                 >
                   <RefreshCw className={cn('mr-1 h-3 w-3', openStreamLoading && 'animate-spin')} />
@@ -2579,91 +2878,20 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
               </div>
             </div>
 
-            <div className="shrink-0 rounded-md border bg-slate-50 dark:bg-slate-900/40 p-2.5 flex flex-wrap items-center justify-center gap-5">
-              <div className="flex flex-col items-center justify-center">
-                <Badge variant="outline" className="mb-2 text-[10px] border-slate-300 text-slate-500">
-                  按下持续移动 · 松开停止
-                </Badge>
-                <div className="relative w-[232px] h-[232px] rounded-full border-2 border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950/80 shadow-inner">
-                  {([
-                    { key: 'up', x: 50, y: 8, dir: 'up' as const, label: '↑', disabled: false },
-                    { key: 'up-right', x: 84, y: 20, dir: 'up-right' as const, label: '↗', disabled: true },
-                    { key: 'right', x: 92, y: 50, dir: 'right' as const, label: '→', disabled: false },
-                    { key: 'down-right', x: 84, y: 80, dir: 'down-right' as const, label: '↘', disabled: true },
-                    { key: 'down', x: 50, y: 92, dir: 'down' as const, label: '↓', disabled: false },
-                    { key: 'down-left', x: 16, y: 80, dir: 'down-left' as const, label: '↙', disabled: true },
-                    { key: 'left', x: 8, y: 50, dir: 'left' as const, label: '←', disabled: false },
-                    { key: 'up-left', x: 16, y: 20, dir: 'up-left' as const, label: '↖', disabled: true },
-                  ] as const).map((p) => {
-                    const btnCls = cn(
-                      'absolute h-10 w-10 rounded-full text-lg font-bold transition-colors select-none -translate-x-1/2 -translate-y-1/2 flex items-center justify-center',
-                      p.disabled
-                        ? 'bg-slate-100 dark:bg-slate-800 text-slate-400 opacity-60 cursor-not-allowed'
-                        : 'bg-indigo-500 hover:bg-indigo-600 active:bg-indigo-700 text-white',
-                    );
-                    const diagsDisabled = p.disabled || !canControl || !deviceDid || ptzLoading;
-                    return (
-                      <button
-                        key={p.key}
-                        type="button"
-                        disabled={diagsDisabled}
-                        className={btnCls}
-                        style={{ left: `${p.x}%`, top: `${p.y}%` }}
-                        onMouseDown={(e) => {
-                          e.preventDefault();
-                          if (p.disabled) return;
-                          if (p.dir.endsWith('left')) handleCameraPTZ('left');
-                          else if (p.dir.endsWith('right')) handleCameraPTZ('right');
-                          if (p.dir.startsWith('up')) handleCameraPTZ('up');
-                          else if (p.dir.startsWith('down')) handleCameraPTZ('down');
-                        }}
-                        onMouseUp={(e) => {
-                          e.preventDefault();
-                          if (p.disabled) return;
-                          handleCameraPTZ('stop');
-                        }}
-                        onMouseLeave={() => {
-                          if (p.disabled) return;
-                          handleCameraPTZ('stop');
-                        }}
-                        onTouchStart={(e) => {
-                          e.preventDefault();
-                          if (p.disabled) return;
-                          if (p.dir.endsWith('left')) handleCameraPTZ('left');
-                          else if (p.dir.endsWith('right')) handleCameraPTZ('right');
-                          if (p.dir.startsWith('up')) handleCameraPTZ('up');
-                          else if (p.dir.startsWith('down')) handleCameraPTZ('down');
-                        }}
-                        onTouchEnd={(e) => {
-                          e.preventDefault();
-                          if (p.disabled) return;
-                          handleCameraPTZ('stop');
-                        }}
-                      >
-                        {p.label}
-                      </button>
-                    );
-                  })}
-                  <button
-                    type="button"
-                    disabled={!canControl || !deviceDid || ptzLoading}
-                    className={cn(
-                      'absolute h-[96px] w-[96px] rounded-full text-sm font-bold transition-colors select-none -translate-x-1/2 -translate-y-1/2 flex flex-col items-center justify-center gap-0.5',
-                      'bg-indigo-700 hover:bg-indigo-800 active:bg-indigo-900 text-white shadow-md',
-                      (!canControl || !deviceDid) && 'opacity-60 cursor-not-allowed',
-                    )}
-                    style={{ left: '50%', top: '50%' }}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleCameraPTZ('stop');
-                    }}
-                    title="回到居中位置"
-                  >
-                    <ShieldAlert className="h-4 w-4" />
-                    <span>居中</span>
-                  </button>
-                </div>
-              </div>
+            <div className="shrink-0 rounded-md border bg-slate-50 dark:bg-slate-900/40 p-3 flex flex-wrap items-center justify-center gap-3">
+              <Badge variant="outline" className="text-[10px] border-slate-300 text-slate-500">
+                方向控制不可用 · 仅支持云台回中
+              </Badge>
+              <Button
+                type="button"
+                size="sm"
+                disabled={!canControl || !deviceDid || ptzLoading}
+                onClick={handleCameraCalibrate}
+                title="云台回中 / 校准"
+              >
+                <RefreshCw className={cn('mr-1 h-4 w-4', ptzLoading && 'animate-spin')} />
+                回中 / 校准
+              </Button>
             </div>
           </div>
         )}

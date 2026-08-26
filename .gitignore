@@ -18,3 +18,15 @@ debug-*.md
 server/generated/
 server/run_lanscan.ps1
 camera-*.png
+client/vite.config.js
+client/vite.config.d.ts
+
+# 打包产物与运行产物
+release/
+server/recordings/
+server/streams/
+
+# go2rtc 二进制与本地凭证（含小米令牌/内网IP，切勿提交）
+go2rtc/go2rtc.exe
+go2rtc/go2rtc_win64.zip
+go2rtc/go2rtc.yaml

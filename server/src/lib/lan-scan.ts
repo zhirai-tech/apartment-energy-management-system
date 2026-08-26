@@ -484,6 +484,36 @@ async function reverseDnsUnix(ip: string): Promise<string | null> {
   return null;
 }
 
+export async function detectLanSubnets(): Promise<string[]> {
+  const base3Set = new Set<string>();
+  try {
+    const nics = os.networkInterfaces();
+    for (const name of Object.keys(nics)) {
+      const list = nics[name];
+      if (!list) continue;
+      for (const info of list) {
+        if (info.family !== 'IPv4' || info.internal) continue;
+        const parts = info.address.split('.');
+        if (parts.length !== 4) continue;
+        base3Set.add(`${parts[0]}.${parts[1]}.${parts[2]}`);
+      }
+    }
+  } catch {
+    // ignore
+  }
+  if (os.platform() === 'win32') {
+    try {
+      const gw = await findDefaultGatewayBase3();
+      if (gw) base3Set.add(gw);
+    } catch {
+      // ignore
+    }
+  }
+  return Array.from(base3Set)
+    .filter((base3) => /^\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(base3))
+    .map((base3) => `${base3}.0/24`);
+}
+
 export interface LanScanOptions {
   subnet: string;
   concurrency?: number;

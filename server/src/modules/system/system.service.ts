@@ -21,6 +21,7 @@ import {
 import prisma from '../../lib/prisma';
 import { probeLanDeviceReachability } from '../../lib/lan-scan';
 import { writeOperation } from '../../lib/logger';
+import { AppError } from '../../lib/errors';
 import { xiaomiAdapter } from './xiaomi.adapter';
 import { HuaweiCpeAdapter } from './huawei-cpe.adapter';
 import { NokiaBeaconAdapter } from './nokia-beacon.adapter';
@@ -28,6 +29,7 @@ import { broadcastDashboard } from '../../lib/socket';
 import { DEFAULT_BUSINESS_TIMEZONE, normalizeBusinessTimeZone } from '../../lib/business-time';
 import { OperationActorContext } from '../../lib/operation-log';
 import { formatRoomDisplayName, normalizeRoomAnnotation } from '../../lib/room-display';
+import { resolveOfflineSince } from '../../lib/device-runtime';
 import { buildBasicAuthHeader, buildBasicAuthToken, buildDigestAuthHeader, normalizeAuthType } from '../../lib/http-auth';
 import crypto from 'crypto';
 import axios from 'axios';
@@ -54,6 +56,20 @@ import {
 void ELECTRICITY_PRICE_REFERENCE_MAP;
 void ALARM_RATIO_KEYS;
 
+interface CameraArmState {
+  rtspUrl: string;
+  armedAt: number;
+  motionState: 'idle' | 'recording';
+  lastMotionAt: number;
+  ringProc: ChildProcessByStdio<null, NodeReadable, NodeReadable> | null;
+  detectProc: ChildProcessByStdio<null, NodeReadable, NodeReadable> | null;
+  recProc: ChildProcessByStdio<null, NodeReadable, NodeReadable> | null;
+  ringDir: string;
+  stagingDir: string | null;
+  liveDir: string | null;
+  pollTimer: NodeJS.Timeout | null;
+}
+
 class SystemService {
   private cameraStreamProcesses = new Map<string, {
     proc: ChildProcessByStdio<null, NodeReadable, NodeReadable>;
@@ -61,6 +77,8 @@ class SystemService {
     rtspUrl: string;
     hlsDir: string;
   }>();
+
+  private cameraArmStates = new Map<string, CameraArmState>();
 
   private safeStringifyModel(obj: unknown, maxLen = 1024): string {
     let current: unknown = obj;
@@ -223,7 +241,7 @@ class SystemService {
   public async ensureCameraStreamProxy(
     did: string,
     rtspUrl: string,
-    meta?: { model?: string; name?: string },
+    meta?: { model?: string; name?: string; transcodeH264?: boolean },
   ): Promise<{
     hlsUrl: string | null;
     webrtcUrl: string | null;
@@ -284,13 +302,16 @@ class SystemService {
 
     const ffmpegArgs = [
       '-rtsp_transport', 'tcp',
-      '-stimeout', '5000000',
+      '-fflags', 'nobuffer',
+      '-timeout', '5000000',
       '-i', rtspUrl,
       '-an',
-      '-c:v', 'copy',
-      '-hls_time', '2',
+      ...(meta?.transcodeH264
+        ? ['-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-pix_fmt', 'yuv420p', '-crf', '23', '-g', '25', '-sc_threshold', '0']
+        : ['-c:v', 'copy']),
+      '-hls_time', '0.5',
       '-hls_list_size', '4',
-      '-hls_flags', 'delete_segments+append_list',
+      '-hls_flags', 'delete_segments+append_list+independent_segments',
       '-hls_allow_cache', '0',
       '-y',
       hlsOutFile,
@@ -355,6 +376,447 @@ class SystemService {
       result.errorMessage = spawnError;
     }
     return result;
+  }
+
+  // 探测宿主机本地 go2rtc（小米 P2P → RTSP 桥）是否已注册指定 DID 的流；
+  // 返回可用的本地 RTSP 地址，否则返回 null。
+  public async resolveLocalGo2rtcRtsp(did: string): Promise<string | null> {
+    const safeDid = String(did || '').replace(/[^a-zA-Z0-9_-]/g, '_') || 'unknown';
+    const go2rtcApi = process.env.GO2RTC_API_URL || 'http://localhost:1984';
+    try {
+      const resp = await axios.get(`${go2rtcApi}/api/streams`, { timeout: 2500 });
+      const streams: Record<string, unknown> = resp.data ?? {};
+      if (streams[safeDid]) {
+        const rtspBase = (process.env.GO2RTC_RTSP_URL || 'rtsp://localhost:8554').replace(/\/+$/, '');
+        return `${rtspBase}/${safeDid}`;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  public getRecordingRoot(): string {
+    return path.resolve(process.cwd(), 'recordings');
+  }
+
+  public getRecordingDir(did: string): string {
+    const safeDid = String(did || '').replace(/[^a-zA-Z0-9_-]/g, '_') || 'unknown';
+    return path.join(this.getRecordingRoot(), safeDid);
+  }
+
+  public isMotionRecording(did: string): boolean {
+    const safeDid = String(did || '').replace(/[^a-zA-Z0-9_-]/g, '_') || 'unknown';
+    const state = this.cameraArmStates.get(safeDid);
+    if (!state) return false;
+    return this.isArmAlive(state);
+  }
+
+  public async startMotionRecording(
+    did: string,
+    rtspUrl: string,
+  ): Promise<{ recording: boolean; errorMessage?: string; processId?: number | null; startedAt?: number }> {
+    const safeDid = String(did || '').replace(/[^a-zA-Z0-9_-]/g, '_') || 'unknown';
+    if (!rtspUrl) {
+      return { recording: false, errorMessage: '未获取到局域网 RTSP 地址，无法录制' };
+    }
+
+    const existing = this.cameraArmStates.get(safeDid);
+    if (existing && this.isArmAlive(existing) && existing.rtspUrl === rtspUrl) {
+      return { recording: true, processId: existing.ringProc?.pid ?? existing.detectProc?.pid ?? null, startedAt: existing.armedAt };
+    }
+    this.disarm(safeDid);
+
+    const recDir = this.getRecordingDir(safeDid);
+    const ringDir = path.join(recDir, '.ring');
+    try {
+      fs.mkdirSync(ringDir, { recursive: true });
+    } catch (err: any) {
+      return { recording: false, errorMessage: `创建录制目录失败：${err?.message || String(err)}` };
+    }
+
+    const threshold = this.motionThreshold();
+    const state: CameraArmState = {
+      rtspUrl,
+      armedAt: Date.now(),
+      motionState: 'idle',
+      lastMotionAt: 0,
+      ringProc: null,
+      detectProc: null,
+      recProc: null,
+      ringDir,
+      stagingDir: null,
+      liveDir: null,
+      pollTimer: null,
+    };
+
+    // 预录环形缓冲：流拷贝（保留源编码，成本最低），仅滚动保留最近约 60 秒（5s × 12 段）
+    const ringArgs = [
+      '-rtsp_transport', 'tcp',
+      '-fflags', 'nobuffer',
+      '-timeout', '5000000',
+      '-i', rtspUrl,
+      '-an',
+      '-c:v', 'copy',
+      '-f', 'segment',
+      '-segment_time', '5',
+      '-segment_wrap', '12',
+      '-segment_format', 'mpegts',
+      '-y',
+      path.join(ringDir, 'seg_%03d.ts'),
+    ];
+    state.ringProc = this.spawnFfmpeg(ringArgs, safeDid, 'ring');
+
+    // 画面变动检测：低分辨率降采样后按 scene 分数判定，事件写入 stderr 由 Node 解析
+    const detectArgs = [
+      '-rtsp_transport', 'tcp',
+      '-fflags', 'nobuffer',
+      '-timeout', '5000000',
+      '-i', rtspUrl,
+      '-an',
+      '-vf', `scale=160:90,fps=2,select='gt(scene,${threshold})',showinfo`,
+      '-f', 'null',
+      '-',
+    ];
+    state.detectProc = this.spawnFfmpeg(detectArgs, safeDid, 'detect', (line) => {
+      if (state.motionState === 'idle') {
+        this.startEvent(safeDid);
+      }
+      state.lastMotionAt = Date.now();
+    });
+
+    if (!state.ringProc && !state.detectProc) {
+      this.disarm(safeDid);
+      return { recording: false, errorMessage: 'ffmpeg 不可用（请将 ffmpeg.exe 放到 PATH 或 server/ 目录）' };
+    }
+
+    this.cameraArmStates.set(safeDid, state);
+
+    // 轮询收尾：画面静止超过尾段时间则把「预录 + 之后画面」合并为正式 mp4
+    state.pollTimer = setInterval(() => {
+      const s = this.cameraArmStates.get(safeDid);
+      if (!s || s !== state) return;
+      if (s.motionState === 'recording' && Date.now() - s.lastMotionAt >= this.tailMs()) {
+        this.finalizeEvent(safeDid);
+      }
+    }, 500);
+
+    this.runRetentionCleanup(recDir);
+    return { recording: true, processId: state.ringProc?.pid ?? state.detectProc?.pid ?? null, startedAt: state.armedAt };
+  }
+
+  public stopMotionRecording(did: string): { recording: boolean } {
+    const safeDid = String(did || '').replace(/[^a-zA-Z0-9_-]/g, '_') || 'unknown';
+    this.disarm(safeDid);
+    return { recording: false };
+  }
+
+  // ──────────────── 智能录像内部状态机 ────────────────
+
+  private motionThreshold(): number {
+    const v = Number(process.env.CAMERA_MOTION_THRESHOLD);
+    return Number.isFinite(v) && v > 0 ? v : 0.04;
+  }
+
+  private tailMs(): number {
+    const v = Number(process.env.CAMERA_TAIL_SECONDS);
+    return (Number.isFinite(v) && v > 0 ? v : 60) * 1000;
+  }
+
+  private isArmAlive(state: CameraArmState): boolean {
+    return (!!state.ringProc && !state.ringProc.killed) || (!!state.detectProc && !state.detectProc.killed);
+  }
+
+  private killProc(proc: ChildProcessByStdio<null, NodeReadable, NodeReadable> | null | undefined): void {
+    if (!proc) return;
+    try { proc.kill('SIGKILL'); } catch { /* noop */ }
+  }
+
+  private rmrf(dir: string): void {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* noop */ }
+  }
+
+  private spawnFfmpeg(
+    args: string[],
+    safeDid: string,
+    tag: string,
+    onStderrLine?: (line: string) => void,
+  ): ChildProcessByStdio<null, NodeReadable, NodeReadable> | null {
+    let proc: ChildProcessByStdio<null, NodeReadable, NodeReadable> | null = null;
+    try {
+      const spawned = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+      proc = spawned as unknown as ChildProcessByStdio<null, NodeReadable, NodeReadable>;
+      proc.on('error', (err) => {
+        console.warn(`[Recording:${tag}] ffmpeg spawn error did=${safeDid} err=${err?.message || err}`);
+      });
+      proc.on('exit', (code, signal) => {
+        console.warn(`[Recording:${tag}] ffmpeg exit did=${safeDid} code=${code} signal=${signal}`);
+      });
+      if (onStderrLine) {
+        let buf = '';
+        proc.stderr.on('data', (chunk: unknown) => {
+          buf += String(chunk || '');
+          const lines = buf.split(/\r?\n/);
+          buf = lines.pop() ?? '';
+          for (const line of lines) {
+            if (/pts_time/.test(line)) onStderrLine(line);
+          }
+        });
+      }
+      proc.stdout.on('data', () => { /* consume */ });
+    } catch (err: any) {
+      console.warn(`[Recording:${tag}] ffmpeg 启动异常 did=${safeDid} err=${err?.message || err}`);
+      return null;
+    }
+    return proc;
+  }
+
+  private startEvent(safeDid: string): void {
+    const state = this.cameraArmStates.get(safeDid);
+    if (!state || state.motionState === 'recording') return;
+
+    const stagingDir = path.join(this.getRecordingDir(safeDid), `.staging-${Date.now()}`);
+    const liveDir = path.join(stagingDir, 'live');
+    try {
+      fs.mkdirSync(liveDir, { recursive: true });
+    } catch {
+      return;
+    }
+
+    // 快照当前环形缓冲作为预录（按 mtime 保持时间顺序，跳过正在写入的最后一段）
+    try {
+      const segs = fs.readdirSync(state.ringDir)
+        .filter((f) => /\.ts$/i.test(f))
+        .map((f) => {
+          const full = path.join(state.ringDir, f);
+          return { full, mtime: fs.statSync(full).mtimeMs };
+        })
+        .sort((a, b) => a.mtime - b.mtime);
+      const complete = segs.slice(0, Math.max(0, segs.length - 1));
+      complete.forEach((seg, i) => {
+        fs.copyFileSync(seg.full, path.join(stagingDir, `pre_${String(i).padStart(3, '0')}.ts`));
+      });
+    } catch { /* noop */ }
+
+    const liveArgs = [
+      '-rtsp_transport', 'tcp',
+      '-fflags', 'nobuffer',
+      '-timeout', '5000000',
+      '-i', state.rtspUrl,
+      '-an',
+      '-c:v', 'copy',
+      '-f', 'segment',
+      '-segment_time', '3',
+      '-segment_format', 'mpegts',
+      '-y',
+      path.join(liveDir, 'live_%03d.ts'),
+    ];
+    state.recProc = this.spawnFfmpeg(liveArgs, safeDid, 'live');
+    state.stagingDir = stagingDir;
+    state.liveDir = liveDir;
+    state.motionState = 'recording';
+    state.lastMotionAt = Date.now();
+  }
+
+  private finalizeEvent(safeDid: string): void {
+    const state = this.cameraArmStates.get(safeDid);
+    if (!state || state.motionState !== 'recording') return;
+
+    const stagingDir = state.stagingDir;
+    const liveDir = state.liveDir;
+    state.motionState = 'idle';
+    state.stagingDir = null;
+    state.liveDir = null;
+    this.killProc(state.recProc);
+    state.recProc = null;
+
+    if (!stagingDir || !liveDir) return;
+
+    let segs: string[] = [];
+    try {
+      const all = fs.readdirSync(stagingDir).filter((f) => /\.ts$/i.test(f));
+      const pre = all.filter((f) => /^pre_\d+\.ts$/i.test(f)).sort();
+      const live = all.filter((f) => /^live_\d+\.ts$/i.test(f)).sort();
+      // 跳过最后一段（可能因杀进程而截断），避免污染正式录像
+      const safeLive = live.slice(0, Math.max(0, live.length - 1));
+      segs = [...pre, ...safeLive].map((f) => path.join(stagingDir, f));
+    } catch { /* noop */ }
+
+    if (segs.length === 0) {
+      this.rmrf(stagingDir);
+      return;
+    }
+
+    const concatList = path.join(stagingDir, 'concat.txt');
+    try {
+      fs.writeFileSync(concatList, segs.map((s) => `file '${s.replace(/'/g, "'\\''")}'`).join('\n'), 'utf8');
+    } catch {
+      this.rmrf(stagingDir);
+      return;
+    }
+
+    const recDir = this.getRecordingDir(safeDid);
+    const finalName = `rec_${this.tsName(new Date())}.mp4`;
+    const finalPath = path.join(recDir, finalName);
+    const finalizeArgs = [
+      '-y',
+      '-fflags', '+genpts',
+      '-f', 'concat',
+      '-safe', '0',
+      '-i', concatList,
+      '-an',
+      '-c:v', 'libx264',
+      '-preset', 'ultrafast',
+      '-pix_fmt', 'yuv420p',
+      '-crf', '26',
+      finalPath,
+    ];
+    const proc = this.spawnFfmpeg(finalizeArgs, safeDid, 'finalize');
+    if (!proc) {
+      this.rmrf(stagingDir);
+      return;
+    }
+    proc.on('exit', (code) => {
+      let ok = false;
+      try {
+        ok = code === 0 && fs.existsSync(finalPath) && fs.statSync(finalPath).size > 0;
+      } catch { /* noop */ }
+      if (!ok) {
+        try { if (fs.existsSync(finalPath)) fs.unlinkSync(finalPath); } catch { /* noop */ }
+      }
+      this.rmrf(stagingDir);
+      this.runRetentionCleanup(recDir);
+      console.info(`[Recording:finalize] did=${safeDid} ok=${ok} file=${ok ? finalName : 'N/A'}`);
+    });
+  }
+
+  private tsName(d: Date): string {
+    const p = (n: number) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  }
+
+  private runRetentionCleanup(recDir: string): void {
+    try {
+      const maxDays = Number(process.env.CAMERA_RETENTION_DAYS ?? '7');
+      const maxBytes = Number(process.env.CAMERA_RETENTION_BYTES ?? String(10 * 1024 * 1024 * 1024));
+      const listMp4 = (): Array<{ full: string; mtime: number; size: number }> =>
+        fs.readdirSync(recDir)
+          .filter((f) => /\.mp4$/i.test(f))
+          .map((f) => {
+            const full = path.join(recDir, f);
+            try {
+              const st = fs.statSync(full);
+              return { full, mtime: st.mtimeMs, size: st.size };
+            } catch {
+              return null;
+            }
+          })
+          .filter((e): e is { full: string; mtime: number; size: number } => !!e);
+
+      let entries = listMp4();
+      if (Number.isFinite(maxDays) && maxDays > 0) {
+        const cutoff = Date.now() - maxDays * 24 * 60 * 60 * 1000;
+        for (const e of entries) {
+          if (e.mtime < cutoff) {
+            try { fs.unlinkSync(e.full); } catch { /* noop */ }
+          }
+        }
+      }
+      if (Number.isFinite(maxBytes) && maxBytes > 0) {
+        entries = listMp4().sort((a, b) => a.mtime - b.mtime);
+        let total = entries.reduce((s, e) => s + e.size, 0);
+        let i = 0;
+        while (total > maxBytes && i < entries.length) {
+          total -= entries[i].size;
+          try { fs.unlinkSync(entries[i].full); } catch { /* noop */ }
+          i += 1;
+        }
+      }
+    } catch { /* noop */ }
+  }
+
+  private disarm(safeDid: string): void {
+    const state = this.cameraArmStates.get(safeDid);
+    if (!state) return;
+    if (state.pollTimer) clearInterval(state.pollTimer);
+    // 若有正在录制的事件，先收尾合并，避免停止布防时丢失未完成的片段
+    if (state.motionState === 'recording') {
+      this.finalizeEvent(safeDid);
+    }
+    this.killProc(state.recProc);
+    this.killProc(state.detectProc);
+    this.killProc(state.ringProc);
+    if (state.stagingDir) this.rmrf(state.stagingDir);
+    this.cameraArmStates.delete(safeDid);
+  }
+
+  public listMotionRecordings(did: string): Array<{ name: string; size: number; mtime: number; url: string }> {
+    const safeDid = String(did || '').replace(/[^a-zA-Z0-9_-]/g, '_') || 'unknown';
+    const recDir = this.getRecordingDir(safeDid);
+    let files: string[] = [];
+    try {
+      files = fs.readdirSync(recDir);
+    } catch {
+      files = [];
+    }
+    const base = `/recordings/${encodeURIComponent(safeDid)}`;
+    return files
+      .filter((f) => /\.mp4$/i.test(f))
+      .map((f) => {
+        const full = path.join(recDir, f);
+        let size = 0;
+        let mtime = 0;
+        try {
+          const st = fs.statSync(full);
+          size = st.size;
+          mtime = st.mtimeMs;
+        } catch { /* noop */ }
+        return { name: f, size, mtime, url: `${base}/${encodeURIComponent(f)}` };
+      })
+      .sort((a, b) => b.mtime - a.mtime);
+  }
+
+  public listAllCameraRecordings(): Array<{ did: string; name: string; size: number; mtime: number; url: string }> {
+    const root = this.getRecordingRoot();
+    let dirs: string[] = [];
+    try {
+      dirs = fs
+        .readdirSync(root, { withFileTypes: true })
+        .filter((d) => d.isDirectory() && !d.name.startsWith('.'))
+        .map((d) => d.name);
+    } catch {
+      dirs = [];
+    }
+    const result: Array<{ did: string; name: string; size: number; mtime: number; url: string }> = [];
+    for (const dir of dirs) {
+      for (const f of this.listMotionRecordings(dir)) {
+        result.push({ did: dir, ...f });
+      }
+    }
+    return result.sort((a, b) => b.mtime - a.mtime);
+  }
+
+  public deleteMotionRecording(did: string, name: string): { deleted: boolean; errorMessage?: string } {
+    const safeDid = String(did || '').replace(/[^a-zA-Z0-9_-]/g, '_') || 'unknown';
+    const safeName = String(name || '').trim();
+    // 仅允许删除指定 DID 目录下的 mp4 文件，杜绝路径穿越
+    if (!safeName || !/^[\w.-]+\.mp4$/i.test(safeName) || safeName.includes('..')) {
+      return { deleted: false, errorMessage: '非法文件名' };
+    }
+    const recDir = this.getRecordingDir(safeDid);
+    const target = path.resolve(recDir, safeName);
+    if (target !== path.join(recDir, safeName)) {
+      return { deleted: false, errorMessage: '非法路径' };
+    }
+    try {
+      if (!fs.existsSync(target)) {
+        return { deleted: false, errorMessage: '文件不存在' };
+      }
+      fs.unlinkSync(target);
+      return { deleted: true };
+    } catch (err: any) {
+      return { deleted: false, errorMessage: err?.message || String(err) };
+    }
   }
 
   private async buildSiteSummary(siteIds?: string[]): Promise<SiteSummary[]> {
@@ -1059,7 +1521,7 @@ class SystemService {
         ? null
         : await prisma.device.findUnique({
             where: { did },
-            select: { id: true, did: true, name: true, model: true, siteId: true, roomId: true },
+            select: { id: true, did: true, name: true, model: true, siteId: true, roomId: true, status: true, offlineSince: true },
           });
       if (!managed && !existingDevice) {
         skipped += 1;
@@ -1289,6 +1751,7 @@ class SystemService {
           model: storedModel,
           roomId: forcePublicFacility ? null : item.roomId || existing?.roomId || null,
           status: prismaStatus,
+          offlineSince: resolveOfflineSince(existing?.status, existing?.offlineSince, prismaStatus === PrismaDeviceStatus.online),
           lastSyncAt: new Date(),
         };
 
@@ -1394,6 +1857,7 @@ class SystemService {
         did: true,
         model: true,
         status: true,
+        offlineSince: true,
       },
     });
 
@@ -1407,6 +1871,14 @@ class SystemService {
         parsed = null;
       }
       if (!parsed) continue;
+
+      // 米家云设备（局域网发现后被米家 API 关联合并）的状态由米家 API 决定，
+      // 不再用 ping/端口/快照探测，避免覆盖真实的米家在线状态。
+      const ownership = typeof parsed.ownership === 'string' ? parsed.ownership : '';
+      const source = typeof parsed.source === 'string' ? parsed.source : '';
+      if (ownership === 'xiaomi' || source === 'account_sync') {
+        continue;
+      }
 
       const camObj =
         parsed.camera && typeof parsed.camera === 'object' && !Array.isArray(parsed.camera)
@@ -1460,6 +1932,7 @@ class SystemService {
         data: {
           model: nextModel,
           status: online ? PrismaDeviceStatus.online : PrismaDeviceStatus.offline,
+          offlineSince: resolveOfflineSince(device.status, device.offlineSince, online),
           lastSyncAt: new Date(),
         },
       });
@@ -1540,6 +2013,187 @@ class SystemService {
     return updated;
   }
 
+  public async updateDeviceCategory(
+    did: string,
+    category: string,
+    operatorUserId: string | null,
+    actorContext?: OperationActorContext,
+  ): Promise<{ did: string; category: string }> {
+    if (!did) throw new Error('缺少设备 DID');
+    if (!category || !Object.values(DeviceCategory).includes(category as DeviceCategory)) {
+      throw new Error('无效的设备分类');
+    }
+    const existing = await prisma.device.findUnique({ where: { did }, select: { id: true, did: true, model: true, name: true } });
+    if (!existing) throw new Error('未找到该设备');
+    let parsed: Record<string, unknown> = { _raw: existing.name ?? 'Device' };
+    try {
+      const obj = JSON.parse(existing.model || '{}');
+      if (obj && typeof obj === 'object') parsed = obj as Record<string, unknown>;
+    } catch {
+      /* ignore */
+    }
+    const nextModel = this.safeStringifyModel({
+      ...parsed,
+      manualCategory: category,
+    });
+    const updated = await prisma.device.update({
+      where: { did },
+      data: { model: nextModel, updatedAt: new Date(), lastSyncAt: new Date() },
+      select: { did: true, name: true },
+    });
+    await writeOperation(
+      operatorUserId,
+      OperationType.update_settings,
+      null,
+      {
+        action: 'update_device_category',
+        actionLabel: '手动调整设备分类',
+        source: actorContext?.source,
+        sourceLabel: actorContext?.sourceLabel,
+        did,
+        category,
+        deviceName: existing.name,
+      },
+      true,
+    );
+    await broadcastDashboard().catch(() => {});
+    return { did, category };
+  }
+
+  public async deleteDevice(
+    did: string,
+    operatorUserId: string | null,
+    actorContext?: OperationActorContext,
+  ): Promise<{ did: string }> {
+    if (!did) throw new Error('缺少设备 DID');
+    const existing = await prisma.device.findUnique({
+      where: { did },
+      select: { id: true, did: true, name: true },
+    });
+    if (!existing) throw new AppError(404, 'DEVICE_NOT_FOUND', '未找到该设备');
+    await prisma.$transaction([
+      prisma.dailyNetworkTraffic.deleteMany({ where: { deviceId: existing.id } }),
+      prisma.device.delete({ where: { did } }),
+    ]);
+    await writeOperation(
+      operatorUserId,
+      OperationType.update_settings,
+      null,
+      {
+        action: 'delete_device',
+        actionLabel: '删除设备',
+        source: actorContext?.source,
+        sourceLabel: actorContext?.sourceLabel,
+        did,
+        deviceName: existing.name,
+      },
+      true,
+    );
+    await broadcastDashboard().catch(() => {});
+    return { did };
+  }
+
+  // 米家云摄像头无法通过 ONVIF/ISAPI HTTP 接口抓图，需先调用 MiOT start_rtsp_stream
+  // 拿到带 token 的 RTSP 地址，再用 ffmpeg 抓一帧 JPEG。
+  private async grabXiaomiSnapshotFrame(
+    did: string,
+    parsed: Record<string, unknown>,
+    rawModel: string,
+  ): Promise<Buffer | null> {
+    const xiaomiDid =
+      typeof parsed.xiaomiDid === 'string' && parsed.xiaomiDid.trim()
+        ? parsed.xiaomiDid.trim()
+        : did;
+    const model =
+      typeof parsed.model === 'string' && parsed.model.trim()
+        ? parsed.model.trim()
+        : rawModel;
+    const scope = parsed.sourceScope === 'main' ? 'main' : 'camera';
+
+    let rtspUrl = '';
+    let snapshotUrl = '';
+    // 优先本地 go2rtc 桥 RTSP，拿不到再退回云端 startRTSPStream
+    try {
+      const localRtsp = await this.resolveLocalGo2rtcRtsp(xiaomiDid);
+      if (localRtsp) {
+        rtspUrl = localRtsp;
+      } else {
+        const info = await xiaomiAdapter.startRTSPStream(xiaomiDid, model, scope);
+        rtspUrl = info.rtspUrl;
+        snapshotUrl = info.snapshotUrl || '';
+      }
+    } catch (err: any) {
+      console.warn('[CameraSnapshot] startRTSPStream failed did=', did, 'err=', err?.message || err);
+      return null;
+    }
+
+    // 优先用 ffmpeg 从 RTSP 流抓真实帧：米家 start-rtsp-stream 返回的快照 URL 可能是
+    // 设备 logo/占位图而非实时画面，直接抓取会导致前端显示米家 logo。
+    if (rtspUrl) {
+      const frame = await new Promise<Buffer | null>((resolve) => {
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        let proc: ReturnType<typeof spawn> | null = null;
+        const chunks: Buffer[] = [];
+        let settled = false;
+        const finish = (buf: Buffer | null) => {
+          if (settled) return;
+          settled = true;
+          if (timer) clearTimeout(timer);
+          resolve(buf);
+        };
+        timer = setTimeout(() => {
+          try { proc?.kill('SIGKILL'); } catch { /* noop */ }
+          finish(null);
+        }, 15000);
+        try {
+          proc = spawn('ffmpeg', [
+            '-rtsp_transport', 'tcp',
+            '-timeout', '5000000',
+            '-i', rtspUrl,
+            '-frames:v', '1',
+            '-f', 'image2pipe',
+            '-vcodec', 'mjpeg',
+            '-q:v', '2',
+            'pipe:1',
+          ], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+        } catch (err: any) {
+          console.warn('[CameraSnapshot] ffmpeg spawn failed did=', did, 'err=', err?.message || err);
+          finish(null);
+          return;
+        }
+        proc.stdout?.on('data', (chunk: unknown) => {
+          chunks.push(Buffer.from(chunk as any));
+        });
+        proc.stderr?.on('data', () => { /* consume */ });
+        proc.on('error', () => finish(null));
+        proc.on('exit', () => {
+          const buf = Buffer.concat(chunks);
+          finish(buf.length > 0 ? buf : null);
+        });
+      });
+      if (frame) return frame;
+    }
+
+    // fallback：直接抓米家返回的快照 URL（可能仍是占位图，但作为兜底）
+    if (snapshotUrl) {
+      try {
+        const resp = await axios.get(snapshotUrl, {
+          responseType: 'arraybuffer',
+          timeout: 8000,
+          validateStatus: (s: number) => s >= 200 && s < 300,
+        });
+        if (resp?.data) {
+          const buf = Buffer.from(resp.data as ArrayBuffer);
+          if (buf.length > 0) return buf;
+        }
+      } catch (err: any) {
+        console.warn('[CameraSnapshot] snapshotUrl fetch failed did=', did, 'err=', err?.message || err);
+      }
+    }
+
+    return null;
+  }
+
   public async getDeviceSnapshot(did: string): Promise<{
     contentType: string;
     buffer: Buffer;
@@ -1557,6 +2211,21 @@ class SystemService {
       if (obj && typeof obj === 'object') parsed = obj;
     } catch {
       parsed = null;
+    }
+    // 米家云摄像头：走 RTSP 抓帧生成快照，避免用无效的 ONVIF/ISAPI HTTP 地址
+    const isXiaomiCamera =
+      parsed?.ownership === 'xiaomi' ||
+      (typeof parsed?.xiaomiDid === 'string' && (parsed.xiaomiDid as string).trim().length > 0);
+    if (isXiaomiCamera) {
+      const frame = await this.grabXiaomiSnapshotFrame(did, parsed!, device.model || '');
+      if (frame) {
+        return {
+          contentType: 'image/jpeg',
+          buffer: frame,
+          tried: ['xiaomi-rtsp-frame'],
+          lastErrorMessage: null,
+        };
+      }
     }
     const camObj =
       parsed && parsed.camera && typeof parsed.camera === 'object'
@@ -2154,7 +2823,7 @@ class SystemService {
     if (!cfg.kind) return { ok: false, kind: 'unknown', errorMessage: '设备未识别为支持的本地适配器类型（5G CPE 或 Nokia Beacon Mesh）' };
     if (!cfg.baseUrl) return { ok: false, kind: cfg.kind, errorMessage: '缺少设备局域网 baseUrl，请在详情抽屉填入 WebUI IP' };
 
-    const device = await prisma.device.findUnique({ where: { did }, select: { did: true, name: true, model: true } });
+    const device = await prisma.device.findUnique({ where: { did }, select: { did: true, name: true, model: true, status: true, offlineSince: true } });
     if (!device) return { ok: false, kind: cfg.kind, errorMessage: '设备不存在' };
 
     let parsed: Record<string, any> = {};
@@ -2313,6 +2982,7 @@ class SystemService {
     const onlineAny = (runtime as any).online;
     if (typeof onlineAny === 'boolean') {
       statusUpdate.status = onlineAny ? PrismaDeviceStatus.online : PrismaDeviceStatus.offline;
+      statusUpdate.offlineSince = resolveOfflineSince(device.status, device.offlineSince, onlineAny);
     }
     statusUpdate.lastSyncAt = new Date();
 

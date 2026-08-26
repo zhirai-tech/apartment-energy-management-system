@@ -13,6 +13,7 @@ import { EnergyLimitsPage } from './pages/EnergyLimitsPage';
 import { SystemSettingsPage } from './pages/SystemSettingsPage';
 import { OperationLogsPage } from './pages/OperationLogsPage';
 import { AlarmCenterPage } from './pages/AlarmCenterPage';
+import { RecordingsPage } from './pages/RecordingsPage';
 import { ForcePasswordChangePage } from './pages/ForcePasswordChangePage';
 import { NetworkDevicePage } from './pages/NetworkDevicePage';
 
@@ -47,6 +48,7 @@ function App() {
             <Route path="network-devices/:did" element={<NetworkDevicePage />} />
             <Route path="logs/operations" element={<OperationLogsPage />} />
             <Route path="logs/alarms" element={<AlarmCenterPage />} />
+            <Route path="recordings" element={<RecordingsPage />} />
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

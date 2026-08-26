@@ -1,6 +1,5 @@
 generator client {
   provider = "prisma-client-js"
-  output   = "../generated/prisma-client"
 }
 
 datasource db {
@@ -176,6 +175,7 @@ model Device {
   voltageV   Float?
   totalKwh   Float?
   lastSyncAt DateTime?
+  offlineSince DateTime?
   createdAt  DateTime     @default(now())
   updatedAt  DateTime     @updatedAt
   dailyNetworkTraffic DailyNetworkTraffic[]

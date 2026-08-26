@@ -14,7 +14,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:3001',
+        target: 'http://localhost:3005',
         changeOrigin: true,
         timeout: 180_000,
         proxyTimeout: 180_000,
@@ -26,8 +26,20 @@ export default defineConfig({
         },
       },
       '/socket.io': {
-        target: 'ws://localhost:3001',
+        target: 'ws://localhost:3005',
         ws: true,
+        changeOrigin: true,
+        timeout: 180_000,
+        proxyTimeout: 180_000,
+      },
+      '/streams': {
+        target: 'http://localhost:3005',
+        changeOrigin: true,
+        timeout: 180_000,
+        proxyTimeout: 180_000,
+      },
+      '/recordings': {
+        target: 'http://localhost:3005',
         changeOrigin: true,
         timeout: 180_000,
         proxyTimeout: 180_000,

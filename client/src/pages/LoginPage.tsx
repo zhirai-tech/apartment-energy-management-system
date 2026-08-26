@@ -76,8 +76,11 @@ export function LoginPage() {
       const from = (location.state as { from?: Location })?.from;
       navigate(from?.pathname ?? '/', { replace: true });
     } catch (err: unknown) {
-      const error = err as { response?: { data?: { message?: string } } };
-      toast.error(error?.response?.data?.message || '登录失败');
+      const message =
+        err instanceof Error && err.message && err.message !== '请求失败'
+          ? err.message
+          : '登录失败';
+      toast.error(message);
     } finally {
       setLoading(false);
     }

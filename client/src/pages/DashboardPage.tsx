@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { LayoutDashboard, BarChart3, Power, RefreshCw, ShieldAlert, BellRing, ZapOff, X, Plus, PencilLine, Search } from 'lucide-react';
 import { toast } from 'sonner';
 import * as api from '@/lib/api';
 import { getSocket } from '@/lib/socket';
+import { inferEndpointTypeLabel } from '@/lib/format';
 import {
   RoomStatus,
   UserRole,
@@ -62,41 +64,16 @@ function normalizeMacKey(value?: string | null): string {
   return String(value ?? '').toUpperCase().replace(/[^A-F0-9]/g, '');
 }
 
-function inferClientEndpointType(input: {
-  name?: string | null;
-  hostname?: string | null;
-  vendor?: string | null;
-  systemCategory?: string | null;
-  interfaceType?: string | null;
-}): string {
-  const category = String(input.systemCategory ?? '').trim();
-  if (category === 'camera') return '摄像头';
-  if (category === 'smart_appliance') return '智能设备';
-  if (category === 'circuit_breaker') return '智能空开';
-  if (category === 'wifi_ap') return '网关';
-  if (category === 'five_g_cpe') return '主路由';
-
-  const text = [
-    input.name ?? '',
-    input.hostname ?? '',
-    input.vendor ?? '',
-    input.interfaceType ?? '',
-  ].join(' ').toLowerCase();
-  if (/(iphone|android|poco|redmi|xiaomi|mi phone|huawei|honor|oppo|vivo|oneplus|realme|galaxy|samsung)/.test(text)) return '手机';
-  if (/(ipad|tablet|tab\b|mi pad|huawei matepad|xiaoxin pad)/.test(text)) return '平板';
-  if (/(macbook|notebook|laptop|desktop|thinkpad|surface|windows|pc\b|lenovo|dell|hp\b|asus|acer|msi)/.test(text)) return '电脑';
-  if (/(amazon|echo|alexa|homepod|google home|nest)/.test(text)) return '音箱';
-  if (/(tv|bravia|hisense|tcl|xiaomi tv|appletv|apple tv|webos)/.test(text)) return '电视';
-  if (/(printer|epson|canon|brother|hp laser|hp ink|打印机)/.test(text)) return '打印机';
-  if (/(switch|breaker|relay|lxzn|miot|tuya|iot|sensor|plug|air purifier|vacuum)/.test(text)) return 'IoT 设备';
-  if (/(beacon|router|mesh|h122|gateway|网关|路由)/.test(text)) return '网络设备';
-  return '未知终端';
-}
-
 function isGenericClientName(value?: string | null): boolean {
   const text = String(value ?? '').trim().toLowerCase();
   if (!text) return true;
   return /^unknown[_-]/.test(text) || /^lan device\b/.test(text) || /^\*no company\*/.test(text);
+}
+
+// 设备级状态 → 卡片级状态：只有明确 online 才显示正常，
+// offline / unknown 一律归为离线，避免「卡片顶部正常、内部离线」的矛盾。
+function roomStatusFromDeviceStatus(status?: string | null): RoomStatus {
+  return status === 'online' ? RoomStatus.NORMAL : RoomStatus.OFFLINE;
 }
 
 function enrichNetworkClients(
@@ -148,7 +125,7 @@ function enrichNetworkClients(
       client?.hostname,
       client?.deviceName,
     ].find((item) => !isGenericClientName(item)) ?? null;
-    const endpointType = inferClientEndpointType({
+    const endpointType = inferEndpointTypeLabel({
       name: matchedTitle ?? rawName,
       hostname: client?.hostname ?? client?.deviceName ?? null,
       vendor: vendorResolved,
@@ -180,6 +157,8 @@ function enrichNetworkClients(
 export function DashboardPage() {
   const DASHBOARD_ALARM_DISPLAY_MS = 12000;
   const queryClient = useQueryClient();
+  const [searchParams] = useSearchParams();
+  const deepLinkCameraDid = searchParams.get('camera');
   const role = useAuthStore((state) => state.role);
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
   const selectedSiteId = useSiteStore((state) => state.selectedSiteId);
@@ -380,7 +359,6 @@ export function DashboardPage() {
     const fallbackManagedDevices = unassigned.filter((device) => {
       const cat = String((device as any).category ?? 'other');
       if (PUBLIC_FACILITY_CATEGORIES.has(cat)) return false;
-      if (cat === 'other') return false;
       return true;
     });
 
@@ -716,7 +694,7 @@ export function DashboardPage() {
           roomNumber: device.roomNumber ?? null,
           roomAnnotation: (device as any).roomAnnotation ?? null,
           floor: 0,
-          status: device.status === 'offline' ? RoomStatus.OFFLINE : RoomStatus.NORMAL,
+          status: roomStatusFromDeviceStatus(device.status),
           power: device.powerW ?? 0,
           todayUsage: (device as any).todayUsageKwh ?? 0,
           monthUsage: 0,
@@ -759,7 +737,22 @@ export function DashboardPage() {
         const idHint = fallbackBits.length > 0
           ? fallbackBits.join(' · ')
           : `DID ${String(device.did).slice(-6)}`;
-        const title = (any.name ?? device.name ?? '').toString().trim() || idHint.slice(0, 16) || '未命名设备';
+        // 优先展示真实名称；名称是通用占位符时，回退到推断的终端类型（手机/电脑/电视等），
+        // 避免未分类设备卡片大面积显示「未知/LAN Device」。
+        const rawName = (any.name ?? device.name ?? '').toString().trim();
+        const endpointType = inferEndpointTypeLabel({
+          name: any.name ?? null,
+          hostname: any.hostname ?? any.hostName ?? null,
+          vendor: any.vendor ?? any.vendorName ?? any.manufacturer ?? any.brand ?? null,
+          systemCategory: any.category ?? null,
+          interfaceType: null,
+        });
+        const title =
+          rawName && !isGenericClientName(rawName)
+            ? rawName
+            : endpointType !== '未知终端'
+              ? endpointType
+              : idHint.slice(0, 16) || '未分类设备';
         return {
           key: device.did,
           title,
@@ -769,7 +762,7 @@ export function DashboardPage() {
           roomNumber: device.roomNumber,
           roomAnnotation: null,
           floor: 1,
-          status: device.status === 'offline' ? RoomStatus.OFFLINE : RoomStatus.NORMAL,
+          status: roomStatusFromDeviceStatus(device.status),
           power: device.powerW ?? 0,
           todayUsage: 0,
           monthUsage: 0,
@@ -844,6 +837,14 @@ export function DashboardPage() {
     }
     setActiveGlobalCategory(presentGlobalCategories[0]);
   }, [presentGlobalCategories, activeGlobalCategory]);
+
+  // 录像回放页深链：?camera=<did> 时切换到摄像头分类，确保摄像头卡片渲染并自动打开详情
+  useEffect(() => {
+    if (!deepLinkCameraDid) return;
+    if (presentGlobalCategories.includes('camera')) {
+      setActiveGlobalCategory('camera');
+    }
+  }, [deepLinkCameraDid, presentGlobalCategories]);
   const floorLabels = useMemo<Array<{ key: string; label: string; sortValue: number; isPublic?: boolean }>>(() => {
     if (!summary) return [];
     const seen = new Map<string, { key: string; label: string; sortValue: number; isPublic?: boolean }>();

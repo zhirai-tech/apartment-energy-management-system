@@ -9,6 +9,7 @@ import {
   Bell,
   LogOut,
   Menu,
+  Film,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { Button } from '../ui/button';
@@ -26,6 +27,7 @@ const menuItems = [
   { to: '/system', icon: Settings, label: '系统设置' },
   { to: '/logs/operations', icon: List, label: '操作日志' },
   { to: '/logs/alarms', icon: Bell, label: '报警中心' },
+  { to: '/recordings', icon: Film, label: '录像回放' },
 ];
 
 export function AppLayout() {

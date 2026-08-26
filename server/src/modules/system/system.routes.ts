@@ -18,9 +18,12 @@ import {
   updateRoomFloor,
   bulkControlDevices,
   lanScan,
+  detectLanSubnet,
   persistLanDevices,
   getDeviceSnapshot,
   updateDeviceCamera,
+  updateDeviceCategory,
+  deleteDevice,
   xiaomiCameraLogin,
   xiaomiCameraSendEmailCode,
   xiaomiCameraVerifyEmailCode,
@@ -28,6 +31,12 @@ import {
   xiaomiCameraStatus,
   getCameraStream,
   controlCameraPTZ,
+  startCameraRecording,
+  stopCameraRecording,
+  getCameraRecordingStatus,
+  listCameraRecordings,
+  deleteCameraRecording,
+  listAllCameraRecordings,
   getDeviceAdapterConfig,
   saveDeviceAdapterConfig,
   refreshDeviceRuntime,
@@ -42,9 +51,12 @@ router.put('/sites/:siteId', authenticate, requireRole(UserRole.admin), updateSi
 router.put('/settings', authenticate, requireRole(UserRole.admin, UserRole.boss), updateSettings);
 router.post('/settings/price-reference/refresh', authenticate, requireRole(UserRole.admin, UserRole.boss), refreshReferencePrice);
 router.post('/lan-scan', authenticate, requireRole(UserRole.admin, UserRole.boss), lanScan);
+router.get('/lan-scan/subnets', authenticate, detectLanSubnet);
 router.post('/lan-device/persist', authenticate, requireRole(UserRole.admin, UserRole.boss), persistLanDevices);
 router.get('/device/:did/snapshot', authenticate, getDeviceSnapshot);
 router.put('/device/:did/camera', authenticate, requireRole(UserRole.admin, UserRole.boss), updateDeviceCamera);
+router.put('/device/:did/category', authenticate, requireRole(UserRole.admin, UserRole.boss), updateDeviceCategory);
+router.delete('/device/:did', authenticate, requireRole(UserRole.admin, UserRole.boss), deleteDevice);
 // ─── Local device adapter: 5G CPE / Nokia Mesh Beacon ───
 router.get('/device/:did/adapter_config', authenticate, getDeviceAdapterConfig);
 router.put('/device/:did/adapter_config', authenticate, requireRole(UserRole.admin, UserRole.boss), saveDeviceAdapterConfig);
@@ -64,6 +76,12 @@ router.get('/xiaomi/camera/devices', authenticate, xiaomiCameraDevices);
 // ─── MiOT camera video stream + PTZ control ───
 router.get('/device/:did/camera_stream', authenticate, getCameraStream);
 router.post('/device/:did/camera_ptz', authenticate, requireRole(UserRole.admin, UserRole.boss), controlCameraPTZ);
+router.post('/device/:did/camera_record/start', authenticate, requireRole(UserRole.admin, UserRole.boss), startCameraRecording);
+router.post('/device/:did/camera_record/stop', authenticate, requireRole(UserRole.admin, UserRole.boss), stopCameraRecording);
+router.get('/device/:did/camera_record/status', authenticate, getCameraRecordingStatus);
+router.get('/device/:did/camera_record/list', authenticate, listCameraRecordings);
+router.delete('/device/:did/camera_record/:name', authenticate, requireRole(UserRole.admin, UserRole.boss), deleteCameraRecording);
+router.get('/camera/recordings', authenticate, listAllCameraRecordings);
 router.post('/devices/control-all', authenticate, requireRole(UserRole.admin, UserRole.boss), bulkControlDevices);
 router.post('/device/:did/control', authenticate, requireRole(UserRole.admin, UserRole.boss), controlDevice);
 router.put('/device/:did/name', authenticate, requireRole(UserRole.admin, UserRole.boss), renameDevice);

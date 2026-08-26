@@ -296,6 +296,8 @@ export const system = {
     api.put(`/system/room/${roomId}/floor`, { floor }).then((res) => res.data),
   renameDevice: (did: string, name: string): Promise<{ did: string; name: string }> =>
     api.put(`/system/device/${did}/name`, { name }).then((res) => res.data),
+  detectLanSubnets: (): Promise<{ subnets: string[] }> =>
+    api.get('/system/lan-scan/subnets').then((res) => res.data),
   lanScan: (subnet: string, options?: { withVendorRemoteApi?: boolean }): Promise<{
     base: string
     totalTried: number
@@ -360,6 +362,10 @@ export const system = {
     hasNightVision?: boolean | null;
   }): Promise<{ did: string }> =>
     api.put(`/system/device/${did}/camera`, data).then((res) => res.data),
+  updateDeviceCategory: (did: string, category: string): Promise<{ did: string; category: string }> =>
+    api.put(`/system/device/${did}/category`, { category }).then((res) => res.data),
+  deleteDevice: (did: string): Promise<{ did: string }> =>
+    api.delete(`/system/device/${did}`).then((res) => res.data),
   xiaomiCameraLogin: (params?: {
     username?: string;
     password?: string;
@@ -505,7 +511,7 @@ export const system = {
   }> => api.get(`/system/device/${did}/camera_stream`).then((res) => res.data),
   controlCameraPTZ: (
     did: string,
-    direction: 'left' | 'right' | 'up' | 'down' | 'stop',
+    direction: 'left' | 'right' | 'up' | 'down' | 'stop' | 'calibrate',
     speed = 50,
   ): Promise<{
     ok: boolean;
@@ -515,6 +521,30 @@ export const system = {
     errorMessage?: string;
   }> =>
     api.post(`/system/device/${did}/camera_ptz`, { direction, speed }).then((res) => res.data),
+  startCameraRecording: (did: string): Promise<{
+    did: string;
+    recording: boolean;
+    processId?: number;
+    startedAt?: number;
+    errorMessage?: string;
+  }> => api.post(`/system/device/${did}/camera_record/start`).then((res) => res.data),
+  stopCameraRecording: (did: string): Promise<{ did: string; recording: boolean }> =>
+    api.post(`/system/device/${did}/camera_record/stop`).then((res) => res.data),
+  getCameraRecordingStatus: (did: string): Promise<{ did: string; recording: boolean }> =>
+    api.get(`/system/device/${did}/camera_record/status`).then((res) => res.data),
+  listCameraRecordings: (did: string): Promise<{
+    did: string;
+    files: Array<{ name: string; size: number; mtime: number; url: string }>;
+  }> => api.get(`/system/device/${did}/camera_record/list`).then((res) => res.data),
+  deleteCameraRecording: (did: string, name: string): Promise<{
+    did: string;
+    name: string;
+    deleted: boolean;
+    errorMessage?: string;
+  }> => api.delete(`/system/device/${did}/camera_record/${encodeURIComponent(name)}`).then((res) => res.data),
+  listAllCameraRecordings: (): Promise<{
+    files: Array<{ did: string; name: string; size: number; mtime: number; url: string }>;
+  }> => api.get('/system/camera/recordings').then((res) => res.data),
   getDeviceAdapterConfig: (did: string): Promise<{
     kind: 'huawei_cpe' | 'nokia_beacon' | null;
     baseUrl: string | null;

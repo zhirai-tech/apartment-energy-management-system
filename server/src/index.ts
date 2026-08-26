@@ -53,6 +53,25 @@ app.use('/streams', (req, res, next) => {
   },
 }));
 
+const RECORDING_ROOT = path.resolve(process.cwd(), 'recordings');
+try {
+  if (!fs.existsSync(RECORDING_ROOT)) fs.mkdirSync(RECORDING_ROOT, { recursive: true });
+} catch {
+  /* noop */
+}
+app.use('/recordings', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  next();
+}, express.static(RECORDING_ROOT, {
+  maxAge: 0,
+  etag: false,
+  lastModified: true,
+  setHeaders: (res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  },
+}));
+
 const loginLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 5,
@@ -69,6 +88,17 @@ app.use('/api/system', systemRoutes);
 app.use('/api/logs', logsRoutes);
 
 setupSwagger(app);
+
+// 原生部署模式：可选由后端直接托管前端构建产物（设置 CLIENT_DIST_DIR 指向 client/dist）。
+const clientDistDir = process.env.CLIENT_DIST_DIR
+  ? path.resolve(process.cwd(), process.env.CLIENT_DIST_DIR)
+  : null;
+if (clientDistDir && fs.existsSync(clientDistDir)) {
+  app.use(express.static(clientDistDir));
+  app.get(/^\/(?!api\/|streams\/|recordings\/|socket\.io\/).*/, (_req, res) => {
+    res.sendFile(path.join(clientDistDir, 'index.html'));
+  });
+}
 
 app.use(notFound);
 app.use(errorHandler);

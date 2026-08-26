@@ -15,6 +15,7 @@ import {
 } from '../../lib/business-time';
 import { OperationActorContext } from '../../lib/operation-log';
 import { formatRoomDisplayName } from '../../lib/room-display';
+import { resolveOfflineSince } from '../../lib/device-runtime';
 import {
   readSessionFromRedis,
   writeSessionToRedis,
@@ -66,6 +67,7 @@ import {
   syncXiaomiDevicesToDb,
   sanitizeRuntimeForUpsert,
   normalizeDeviceTelemetryValue,
+  buildXiaomiModelMeta,
 } from './lib/xiaomi-devices';
 
 function getEnvCredentials() {
@@ -161,16 +163,28 @@ function mergeCookieHeader(
 }
 
 function getCookieValue(cookieHeader: string, name: string): string {
+  // 取最后一个匹配项，避免历史合并残留的 `serviceToken=EXPIRED` 掩盖后面的真实值。
+  let result = '';
   for (const part of String(cookieHeader || '').split(';')) {
     const item = part.trim();
     if (!item) continue;
     const eqIndex = item.indexOf('=');
     if (eqIndex <= 0) continue;
     if (item.slice(0, eqIndex) === name) {
-      return item.slice(eqIndex + 1);
+      result = item.slice(eqIndex + 1);
     }
   }
-  return '';
+  return result;
+}
+
+function extractQueryParam(url: string, name: string): string {
+  if (!url) return '';
+  try {
+    return new URL(url).searchParams.get(name) || '';
+  } catch {
+    const m = new RegExp(`[?&]${name}=([^&#]+)`).exec(url);
+    return m ? decodeURIComponent(m[1]) : '';
+  }
 }
 
 function resolveRedirectUrl(location: string, baseUrl: string): string {
@@ -181,14 +195,23 @@ function resolveRedirectUrl(location: string, baseUrl: string): string {
   }
 }
 
+// 米家 API 实际使用的地区子域白名单。登录流程里会出现 `sts.api.io.mi.com`
+// 这样的通用跳转域，若不加白名单会被误识别成 region="sts"，导致后续请求
+// 全部打到无效端点、报“会话已失效或地区不匹配”。这里只放真实地区码。
+const XIAOMI_REGION_CODES = new Set(['cn', 'de', 'ru', 'tw', 'sg', 'in', 'us']);
+
 function inferRegionFromUrls(...urls: Array<string | null | undefined>): string | undefined {
   for (const url of urls) {
     const text = String(url ?? '').trim();
     if (!text) continue;
     const queryMatch = text.match(/[?&]region=([a-z0-9]{2,3})/i);
-    if (queryMatch?.[1]) return queryMatch[1].toLowerCase();
+    if (queryMatch?.[1] && XIAOMI_REGION_CODES.has(queryMatch[1].toLowerCase())) {
+      return queryMatch[1].toLowerCase();
+    }
     const hostMatch = text.match(/https:\/\/([a-z0-9]{2,3})\.api\.io\.mi\.com/i);
-    if (hostMatch?.[1]) return hostMatch[1].toLowerCase();
+    if (hostMatch?.[1] && XIAOMI_REGION_CODES.has(hostMatch[1].toLowerCase())) {
+      return hostMatch[1].toLowerCase();
+    }
   }
   return undefined;
 }
@@ -197,8 +220,11 @@ function preferredChallengeVerificationMethod(
   scope: XiaomiSessionScope,
   region?: string,
 ): 'browser' | 'email_code' {
-  if (scope === 'camera') return 'browser';
-  if (isIntlRegion(region)) return 'browser';
+  // 米家账号 SSO 统一为 account.xiaomi.com，中国区(cn)与欧洲区(de)账号的两步验证
+  // 均通过邮箱验证码完成。此前 camera 被强制走 'browser'，导致前端不会自动发送
+  // 邮箱验证码、登录卡死在验证环节，现统一改为 email_code。
+  void scope;
+  void region;
   return 'email_code';
 }
 
@@ -877,8 +903,14 @@ class XiaomiAdapter {
     const stsResult = await this.followRedirectsWithCookies(stsUrl, cookieHeader);
     cookieHeader = stsResult.cookieHeader;
 
-    const serviceToken = decodeURIComponent(getCookieValue(cookieHeader, 'serviceToken') || '');
+    // 真实 serviceToken/userId 优先从 STS 跳转终点 URL 的查询参数里取（更可靠），
+    // 拿不到再回退到 Cookie 头；避免被合并残留的 `serviceToken=EXPIRED` 污染。
+    const serviceToken =
+      extractQueryParam(stsResult.finalUrl, 'serviceToken') ||
+      decodeURIComponent(getCookieValue(cookieHeader, 'serviceToken') || '');
     const userId =
+      extractQueryParam(stsResult.finalUrl, 'userId') ||
+      extractQueryParam(stsResult.finalUrl, 'cUserId') ||
       decodeURIComponent(getCookieValue(cookieHeader, 'userId') || '') ||
       decodeURIComponent(getCookieValue(cookieHeader, 'cUserId') || '');
 
@@ -2541,6 +2573,7 @@ class XiaomiAdapter {
         where: { did: deviceDid },
         data: {
           status: DeviceStatus.online,
+          offlineSince: null,
           power: true,
           powerW: safe.powerW,
           currentA: safe.currentA,
@@ -2640,6 +2673,7 @@ class XiaomiAdapter {
         where: { did: deviceDid },
         data: {
           status: DeviceStatus.online,
+          offlineSince: null,
           power: false,
           powerW: safe.powerW ?? 0,
           currentA: safe.currentA ?? 0,
@@ -2729,6 +2763,19 @@ class XiaomiAdapter {
 
   public async refreshAllRoomsRealtime(): Promise<void> {
     const devices = await this.fetchDevices();
+    // 追加摄像头设备（camera 账号 scope）：摄像头不在主设备列表里，需单独拉取，
+    // 否则断电后摄像头在线状态不会随定时任务刷新，会一直停留在旧的“在线”。
+    const cameraDevices = await this.fetchCameraDevices().catch((e) => {
+      console.warn('[XiaomiAdapter] refreshAllRoomsRealtime 摄像头列表拉取失败：', e?.message || e);
+      return [] as XiaomiDeviceInfo[];
+    });
+    const seenDids = new Set(devices.map((d) => d.did));
+    for (const cam of cameraDevices) {
+      if (!seenDids.has(cam.did)) {
+        devices.push(cam);
+        seenDids.add(cam.did);
+      }
+    }
     const [defaultSite, rooms] = await Promise.all([
       prisma.site.findFirst({
         where: { isPrimary: true },
@@ -2749,15 +2796,92 @@ class XiaomiAdapter {
     const roomSiteMap = new Map(rooms.map((room) => [room.id, room.siteId]));
 
     const now = new Date();
+
+    // 预加载局域网设备：与 syncXiaomiDevicesToDb 保持一致，把米家云设备
+    // （尤其是摄像头）按 localIp / 米家 did 关联回已有的 LAN_ 记录。
+    // 否则每次实时刷新都会按米家 did 另建一条重复记录，且会覆盖 model 元数据，
+    // 导致仪表盘出现同一摄像头的重复卡片与状态不一致。
+    const parseModelObject = (model: string | null): Record<string, unknown> | null => {
+      if (!model) return null;
+      try {
+        const obj = JSON.parse(model);
+        return obj && typeof obj === 'object' && !Array.isArray(obj)
+          ? (obj as Record<string, unknown>)
+          : null;
+      } catch {
+        return null;
+      }
+    };
+    const lanDevices = await prisma.device.findMany({
+      where: { did: { startsWith: 'LAN_' } },
+      select: {
+        did: true,
+        name: true,
+        model: true,
+        siteId: true,
+        powerW: true,
+        currentA: true,
+        voltageV: true,
+        totalKwh: true,
+        power: true,
+        status: true,
+        offlineSince: true,
+      },
+    });
+    const lanByIp = new Map<string, (typeof lanDevices)[number]>();
+    const lanByXiaomiDid = new Map<string, (typeof lanDevices)[number]>();
+    for (const ld of lanDevices) {
+      const parsed = parseModelObject(ld.model);
+      if (!parsed) continue;
+      const ip = typeof parsed.ipAddress === 'string' && parsed.ipAddress.trim() ? parsed.ipAddress.trim() : null;
+      if (ip) lanByIp.set(ip, ld);
+      const xd = typeof parsed.xiaomiDid === 'string' && parsed.xiaomiDid.trim() ? parsed.xiaomiDid.trim() : null;
+      if (xd) lanByXiaomiDid.set(xd, ld);
+    }
+    const claimedLanDid = new Set<string>();
+
     for (const device of devices) {
+      const localIp = typeof device.localIp === 'string' ? device.localIp.trim() : '';
+      const matchedLan =
+        lanByXiaomiDid.get(device.did) ??
+        (localIp ? lanByIp.get(localIp) ?? null : null) ??
+        null;
+      const canClaim = matchedLan && !claimedLanDid.has(matchedLan.did) ? matchedLan : null;
+      if (canClaim) claimedLanDid.add(canClaim.did);
+      const targetDid = canClaim ? canClaim.did : device.did;
+
+      // 已按 IP/did 合并到 LAN_ 记录后，清理此前实时刷新误建的米家 did 重复记录，
+      // 避免仪表盘再次出现同一摄像头的第二张卡片。
+      if (canClaim && device.did !== canClaim.did) {
+        await prisma.device.deleteMany({ where: { did: device.did } });
+      }
+
       const siteId =
         (device.roomId ? roomSiteMap.get(device.roomId) : null) ??
         device.siteId ??
+        canClaim?.siteId ??
         fallbackSiteId;
       const previous = await prisma.device.findUnique({
-        where: { did: device.did },
-        select: { powerW: true, currentA: true, voltageV: true, totalKwh: true, power: true },
-      }) as DeviceRuntimePrevious | null;
+        where: { did: targetDid },
+        select: {
+          name: true,
+          model: true,
+          powerW: true,
+          currentA: true,
+          voltageV: true,
+          totalKwh: true,
+          power: true,
+          status: true,
+          offlineSince: true,
+        },
+      });
+      const existingMeta = parseModelObject(previous?.model ?? null);
+      const mergedMeta = {
+        ...(existingMeta ?? {}),
+        ...buildXiaomiModelMeta(device),
+      };
+      const modelJson = JSON.stringify(mergedMeta);
+
       const safe = sanitizeRuntimeForUpsert(
         {
           powerW: device.powerW,
@@ -2766,35 +2890,44 @@ class XiaomiAdapter {
           totalKwh: device.totalKwh,
           online: device.online,
         },
-        previous,
+        previous as DeviceRuntimePrevious | null,
       );
+      const online = safe.online === true;
+      const offlineSince = resolveOfflineSince(previous?.status, previous?.offlineSince, online);
+      const name =
+        (typeof device.name === 'string' && device.name.trim() ? device.name.trim() : '') ||
+        previous?.name ||
+        device.name;
+
       await prisma.device.upsert({
-        where: { did: device.did },
+        where: { did: targetDid },
         update: {
           siteId,
-          name: device.name,
-          model: device.model,
+          name,
+          model: modelJson,
           roomId: device.roomId ?? undefined,
-          status: (safe.online ? 'online' : 'offline') as DeviceStatus,
+          status: (online ? 'online' : 'offline') as DeviceStatus,
           power: safe.power,
           powerW: safe.powerW,
           currentA: safe.currentA,
           voltageV: safe.voltageV,
           totalKwh: safe.totalKwh,
+          offlineSince,
           lastSyncAt: now,
         },
         create: {
-          did: device.did,
+          did: targetDid,
           siteId,
-          name: device.name,
-          model: device.model,
-          roomId: device.roomId,
-          status: (safe.online ? 'online' : 'offline') as DeviceStatus,
+          name,
+          model: modelJson,
+          roomId: device.roomId ?? null,
+          status: (online ? 'online' : 'offline') as DeviceStatus,
           power: safe.power,
           powerW: safe.powerW,
           currentA: safe.currentA,
           voltageV: safe.voltageV,
           totalKwh: safe.totalKwh,
+          offlineSince,
           lastSyncAt: now,
         },
       });
@@ -2810,6 +2943,8 @@ class XiaomiAdapter {
           did: true,
           name: true,
           model: true,
+          status: true,
+          offlineSince: true,
         },
       });
 
@@ -2828,6 +2963,7 @@ class XiaomiAdapter {
           where: { did: device.did },
           data: {
             status: DeviceStatus.offline,
+            offlineSince: resolveOfflineSince(device.status, device.offlineSince, false),
             power: false,
             powerW: 0,
             currentA: 0,
@@ -2881,7 +3017,9 @@ class XiaomiAdapter {
       throw new AppError(400, 'XIAOMI_SESSION_INVALID', `当前米家${scope === 'camera' ? '摄像头区' : ''}会话不是真实会话`);
     }
     const path = '/app/miotspec/action';
-    const payload = { did, siid, aiid, in: input };
+    // MiOT /app/miotspec/action 的 body 为 { params: { did, siid, aiid, in } }（单个对象），
+    // 扁平 { did, siid, aiid, in } → code=-6，数组 { params: [...] } → code=-8
+    const payload = { params: { did, siid, aiid, in: input } };
     const result = await this.requestIo(session, 'POST', path, undefined, payload);
     return result;
   }
@@ -2889,40 +3027,44 @@ class XiaomiAdapter {
   // ──────────────── Camera Spec mapping (MBC23 / C300 / C200 etc.) ────────────────
 
   private getCameraSpecForModel(model: string): {
-    rtsp: { siid: number; aiid_start: number; aiid_stop?: number };
+    rtsp: { siid: number; aiid_start: number; aiid_stop?: number; input?: any[] };
     ptz?: { siid: number; aiid_move: number; aiid_stop?: number };
   } {
     const m = (model || '').toLowerCase();
+    // 米家摄像头云端 RTSP 启动统一在「camera-stream-for-amazon-alexa」服务：
+    //   siid=19, aiid=1 = start-rtsp-stream
+    //   入参 [视频编码属性]（1=1920_1080_30，2=1280_720_30）
+    // 旧映射 siid=18 会返回 code=-6 / -8
     // Xiaomi Smart Camera C301 (MBC23) - EU version
     if (m.includes('mbc23') || m.includes('c301') || m.includes('xiaomi.camera.c301')) {
       return {
-        rtsp: { siid: 18, aiid_start: 1 },
+        rtsp: { siid: 19, aiid_start: 1, input: [1] },
         ptz: { siid: 19, aiid_move: 1, aiid_stop: 2 },
       };
     }
     // Xiaomi Outdoor Camera AW200 / AW300
     if (m.includes('aw200') || m.includes('aw300') || m.includes('aw301')) {
       return {
-        rtsp: { siid: 18, aiid_start: 1 },
+        rtsp: { siid: 19, aiid_start: 1, input: [1] },
       };
     }
     // Xiaomi Camera C200 (MJSXJ03HL)
     if (m.includes('mjsxj03hl') || m.includes('c200')) {
       return {
-        rtsp: { siid: 18, aiid_start: 1 },
+        rtsp: { siid: 19, aiid_start: 1, input: [1] },
         ptz: { siid: 19, aiid_move: 1, aiid_stop: 2 },
       };
     }
     // Mi Home Security Camera 360° 1080P (MJSXJ05CM / MJSXJ02CM)
     if (m.includes('mjsxj05cm') || m.includes('mjsxj02cm') || m.includes('2k') || m.includes('360')) {
       return {
-        rtsp: { siid: 18, aiid_start: 1 },
+        rtsp: { siid: 19, aiid_start: 1, input: [1] },
         ptz: { siid: 19, aiid_move: 1, aiid_stop: 2 },
       };
     }
     // Default generic camera Spec (shared by most Xiaomi cameras)
     return {
-      rtsp: { siid: 18, aiid_start: 1 },
+      rtsp: { siid: 19, aiid_start: 1, input: [1] },
       ptz: { siid: 19, aiid_move: 1, aiid_stop: 2 },
     };
   }
@@ -2937,10 +3079,11 @@ class XiaomiAdapter {
     streamAddress: string;
     streamAuthToken: string;
     rtspUrl: string;
+    snapshotUrl: string;
     rawResult: any;
   }> {
     const spec = this.getCameraSpecForModel(model);
-    const raw = await this.callDeviceAction(did, spec.rtsp.siid, spec.rtsp.aiid_start, [], scope);
+    const raw = await this.callDeviceAction(did, spec.rtsp.siid, spec.rtsp.aiid_start, spec.rtsp.input ?? [], scope);
     // Xiaomi usually returns the result in {result: {out: [...]}} or directly as an array
     let outArr: any[] = [];
     if (Array.isArray(raw)) outArr = raw;
@@ -2951,18 +3094,23 @@ class XiaomiAdapter {
       const arr = vals.find((v: any) => Array.isArray(v)) as any[] | undefined;
       if (arr) outArr = arr;
     }
-    // stream_address / stream_auth_token are the first two items of the out array
+    // out[0] = 流地址；out[1] 可能是鉴权 token（局域网直连）或快照 URL（云端转码流）
     const streamAddress = String(
       outArr[0] ?? raw?.stream_address ?? raw?.['stream-address'] ?? raw?.address ?? '',
     ).trim();
-    const streamAuthToken = String(
-      outArr[1] ?? raw?.stream_auth_token ?? raw?.['stream-auth-token'] ?? raw?.token ?? '',
-    ).trim();
+    const second = String(outArr[1] ?? '').trim();
+    const isSecondUrl = /^(https?|rtsp):\/\//i.test(second);
+    const streamAuthToken = isSecondUrl
+      ? ''
+      : String(outArr[1] ?? raw?.stream_auth_token ?? raw?.['stream-auth-token'] ?? raw?.token ?? '').trim();
+    const snapshotUrl = isSecondUrl
+      ? second
+      : String(raw?.image_snapshot ?? raw?.['image-snapshot'] ?? '').trim();
     if (!streamAddress) {
       console.error('[XiaomiAdapter] startRTSPStream 未解析到 streamAddress，原始返回：', JSON.stringify(raw).slice(0, 800));
       throw new Error('米家摄像头未返回 stream_address，请确认设备型号与 Spec 映射是否匹配');
     }
-    // Build an authenticated RTSP URL (direct LAN, no cloud round-trip)
+    // Build an authenticated RTSP URL (only inject basic auth when a real token exists)
     let rtspUrl = streamAddress;
     if (streamAuthToken) {
       try {
@@ -2980,8 +3128,31 @@ class XiaomiAdapter {
       streamAddress,
       streamAuthToken,
       rtspUrl,
+      snapshotUrl,
       rawResult: raw,
     };
+  }
+
+  // ──────────────── Camera: start HLS stream (Google Home) ────────────────
+
+  public async startHLSStream(
+    did: string,
+    scope: XiaomiSessionScope = 'camera',
+  ): Promise<{ hlsUrl: string; rawResult: any }> {
+    // Google Home 集成：camera-stream-for-google-home (siid=20), start-hls-stream (aiid=1)
+    const raw = await this.callDeviceAction(did, 20, 1, [1], scope);
+    console.info('[XiaomiAdapter] startHLSStream raw did=', did, '=', JSON.stringify(raw).slice(0, 1200));
+    let outArr: any[] = [];
+    if (Array.isArray(raw)) outArr = raw;
+    else if (Array.isArray(raw?.out)) outArr = raw.out;
+    else if (Array.isArray(raw?.result?.out)) outArr = raw.result.out;
+    else if (raw && typeof raw === 'object') {
+      const vals = Object.values(raw);
+      const arr = vals.find((v: any) => Array.isArray(v)) as any[] | undefined;
+      if (arr) outArr = arr;
+    }
+    const hlsUrl = String(outArr[0] ?? '').trim();
+    return { hlsUrl, rawResult: raw };
   }
 
   // ──────────────── Camera: PTZ control ────────────────
@@ -3015,6 +3186,13 @@ class XiaomiAdapter {
     if (dirCode === undefined) throw new Error(`未知云台方向：${direction}`);
     const speedSafe = Math.max(0, Math.min(100, Number(speed) || 50));
     await this.callDeviceAction(did, spec.ptz.siid, spec.ptz.aiid_move, [dirCode, speedSafe], scope);
+    return true;
+  }
+
+  // ──────────────── Camera: PTZ 回中/校准 ────────────────
+  // C301 云 API 只暴露 camera-control(siid=2) → ptz-calibrate(aiid=1)，无方向控制动作。
+  public async calibrateCameraPTZ(did: string, scope: XiaomiSessionScope = 'camera'): Promise<boolean> {
+    await this.callDeviceAction(did, 2, 1, [], scope);
     return true;
   }
 

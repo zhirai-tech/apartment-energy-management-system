@@ -36,6 +36,18 @@ services:
       timeout: 5s
       retries: 5
 
+  go2rtc:
+    image: alexxit/go2rtc:latest
+    container_name: zaem-go2rtc
+    restart: always
+    volumes:
+      - ./go2rtc/go2rtc.yaml:/config/go2rtc.yaml
+    ports:
+      - "1984:1984"
+      - "8554:8554"
+    networks:
+      - zaem-network
+
   server:
     build:
       context: .
@@ -48,16 +60,23 @@ services:
       NODE_ENV: production
       DATABASE_URL: postgresql://zaem:zaem_password@postgres:5432/zaem_db?schema=public
       REDIS_URL: redis://redis:6379
-      JWT_SECRET: zaem_jwt_secret_change_in_production
+      JWT_SECRET: ${JWT_SECRET:-zaem_jwt_secret_change_in_production}
       PORT: 3001
-      CORS_ORIGIN: http://localhost:3010
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3010}
+      GO2RTC_API_URL: http://go2rtc:1984
+      GO2RTC_RTSP_URL: rtsp://go2rtc:8554
       XIAOMI_USERNAME: ${XIAOMI_USERNAME:-}
       XIAOMI_PASSWORD: ${XIAOMI_PASSWORD:-}
+    volumes:
+      - recordings_data:/app/server/recordings
+      - streams_data:/app/server/streams
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      go2rtc:
+        condition: service_started
     networks:
       - zaem-network
 
@@ -77,6 +96,8 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  recordings_data:
+  streams_data:
 
 networks:
   zaem-network:

@@ -4,7 +4,28 @@ import { systemService } from './system.service';
 import { xiaomiAdapter } from './xiaomi.adapter';
 import { XIAOMI_USERNAME, XIAOMI_PASSWORD } from '../../config/env';
 import { getOperationActorContextFromRequest } from '../../lib/request-context';
-import { scanLanDevices } from '../../lib/lan-scan';
+import { scanLanDevices, detectLanSubnets } from '../../lib/lan-scan';
+
+// 从 device.model JSON 解析米家云摄像头真实 DID 与会话区；
+// 局域网扫描到的摄像头主键是 LAN_ 前缀，米家 API 需要数字 DID（model.xiaomiDid）。
+function resolveXiaomiDeviceRef(
+  model: string,
+  fallbackDid: string,
+): { did: string; scope: 'main' | 'camera' } {
+  let obj: Record<string, unknown> | null = null;
+  try {
+    const parsed = model ? JSON.parse(model) : null;
+    if (parsed && typeof parsed === 'object') obj = parsed as Record<string, unknown>;
+  } catch {
+    obj = null;
+  }
+  const xiaomiDid =
+    obj && typeof obj.xiaomiDid === 'string' && obj.xiaomiDid.trim()
+      ? obj.xiaomiDid.trim()
+      : fallbackDid;
+  const scope = obj && obj.sourceScope === 'main' ? 'main' : 'camera';
+  return { did: xiaomiDid, scope };
+}
 
 export const getSettings = async (
   req: Request,
@@ -714,6 +735,19 @@ export const bulkControlDevices = async (
   }
 };
 
+export const detectLanSubnet = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const subnets = await detectLanSubnets();
+    res.json({ subnets });
+  } catch (error) {
+    next(error);
+  }
+};
+
 export const lanScan = async (
   req: Request,
   res: Response,
@@ -887,6 +921,58 @@ export const updateDeviceCamera = async (
         manualBrand: body.manualBrand,
         manualModel: body.manualModel,
       },
+      operatorUserId,
+      getOperationActorContextFromRequest(req),
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const updateDeviceCategory = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { did } = req.params;
+    const { category } = (req.body ?? {}) as { category?: string };
+    const operatorUserId = req.user!.id;
+    if (!did) {
+      res.status(400).json({ code: 'DID_REQUIRED', message: '缺少设备 DID' });
+      return;
+    }
+    if (typeof category !== 'string' || !category.trim()) {
+      res.status(400).json({ code: 'CATEGORY_REQUIRED', message: '缺少设备分类' });
+      return;
+    }
+    const result = await systemService.updateDeviceCategory(
+      did,
+      category.trim(),
+      operatorUserId,
+      getOperationActorContextFromRequest(req),
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const deleteDevice = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { did } = req.params;
+    const operatorUserId = req.user!.id;
+    if (!did) {
+      res.status(400).json({ code: 'DID_REQUIRED', message: '缺少设备 DID' });
+      return;
+    }
+    const result = await systemService.deleteDevice(
+      did,
       operatorUserId,
       getOperationActorContextFromRequest(req),
     );
@@ -1133,9 +1219,52 @@ export const getCameraStream = async (
     );
     const model = device?.model ?? '';
     const name = device?.name ?? '';
-    // ① Call MiOT start_rtsp_stream to obtain the LAN RTSP address + token
-    const rtspInfo = await xiaomiAdapter.startRTSPStream(did, model, 'camera');
-    // ② Let the media layer (ffmpeg / MediaMTX) convert to browser-playable HLS + WebRTC
+    // 米家云摄像头需使用其数字 DID（存储在 model.xiaomiDid），而非局域网 LAN_ 前缀主键
+    const xiaomiDevice = resolveXiaomiDeviceRef(model, did);
+    // ① 优先宿主机本地 go2rtc 桥（小米 P2P 私流 → 本地 RTSP → ffmpeg 转 H.264 HLS）：
+    //    低延迟、局域网直连、无云端转码，浏览器可直接播放
+    const localRtsp = await systemService.resolveLocalGo2rtcRtsp(xiaomiDevice.did);
+    if (localRtsp) {
+      const streamUrls = await systemService.ensureCameraStreamProxy(did, localRtsp, {
+        model,
+        name,
+        transcodeH264: true,
+      });
+      res.json({
+        did,
+        model,
+        streamAddress: '',
+        streamAuthToken: '',
+        rtspUrl: localRtsp,
+        ...streamUrls,
+      });
+      return;
+    }
+    // ② 兜底 Google Home HLS 云端流（siid=20）：go2rtc 未运行时退回此前的云端出画
+    try {
+      const hls = await xiaomiAdapter.startHLSStream(xiaomiDevice.did, xiaomiDevice.scope);
+      if (hls.hlsUrl) {
+        res.json({
+          did,
+          model,
+          streamAddress: '',
+          streamAuthToken: '',
+          rtspUrl: '',
+          hlsUrl: hls.hlsUrl,
+          webrtcUrl: null,
+          hlsReady: true,
+          proxyMode: 'xiaomi-hls',
+          startedAt: null,
+          processId: null,
+          ffmpegAvailable: true,
+        });
+        return;
+      }
+    } catch (e: any) {
+      console.warn('[CameraStream] startHLSStream failed, fallback RTSP', e?.message || e);
+    }
+    // ② fallback：RTSP → ffmpeg 本地转 HLS（部分机型需在国际版开启 RTSP 后才可用）
+    const rtspInfo = await xiaomiAdapter.startRTSPStream(xiaomiDevice.did, model, xiaomiDevice.scope);
     const streamUrls = await systemService.ensureCameraStreamProxy(did, rtspInfo.rtspUrl, {
       model,
       name,
@@ -1162,31 +1291,152 @@ export const controlCameraPTZ = async (
   try {
     const { did } = req.params;
     const { direction, speed } = (req.body ?? {}) as {
-      direction?: 'left' | 'right' | 'up' | 'down' | 'stop';
+      direction?: 'left' | 'right' | 'up' | 'down' | 'stop' | 'calibrate';
       speed?: number;
     };
     if (!did) {
       res.status(400).json({ code: 'DID_REQUIRED', message: '缺少设备 DID' });
       return;
     }
-    if (!direction || !['left', 'right', 'up', 'down', 'stop'].includes(direction)) {
+    if (!direction || !['left', 'right', 'up', 'down', 'stop', 'calibrate'].includes(direction)) {
       res.status(400).json({
         code: 'INVALID_DIRECTION',
-        message: 'direction 必须是 left / right / up / down / stop',
+        message: 'direction 必须是 left / right / up / down / stop / calibrate',
       });
       return;
     }
     const device = await systemService.prismaWrap(async (p) =>
       p.device.findUnique({ where: { did }, select: { model: true } }),
     );
+    const xiaomiDevice = resolveXiaomiDeviceRef(device?.model ?? '', did);
+    // 云台回中/校准：C301 云端仅支持 ptz-calibrate 动作，无方向控制
+    if (direction === 'calibrate') {
+      const ok = await xiaomiAdapter.calibrateCameraPTZ(xiaomiDevice.did, xiaomiDevice.scope);
+      res.json({ ok: !!ok, did, direction, speed: 0 });
+      return;
+    }
     const ok = await xiaomiAdapter.moveCameraPTZ(
-      did,
+      xiaomiDevice.did,
       direction,
       typeof speed === 'number' ? speed : 50,
       device?.model ?? '',
-      'camera',
+      xiaomiDevice.scope,
     );
     res.json({ ok: !!ok, did, direction, speed: typeof speed === 'number' ? speed : 50 });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ──────────────── Camera: server-side motion-triggered recording ────────────────
+export const startCameraRecording = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { did } = req.params;
+    if (!did) {
+      res.status(400).json({ code: 'DID_REQUIRED', message: '缺少设备 DID' });
+      return;
+    }
+    const device = await systemService.prismaWrap(async (p) =>
+      p.device.findUnique({ where: { did }, select: { model: true } }),
+    );
+    const xiaomiDevice = resolveXiaomiDeviceRef(device?.model ?? '', did);
+    // 优先本地 go2rtc 桥 RTSP，拿不到再退回云端 startRTSPStream
+    let rtspUrl = await systemService.resolveLocalGo2rtcRtsp(xiaomiDevice.did);
+    if (!rtspUrl) {
+      const rtspInfo = await xiaomiAdapter.startRTSPStream(
+        xiaomiDevice.did,
+        device?.model ?? '',
+        xiaomiDevice.scope,
+      );
+      rtspUrl = rtspInfo.rtspUrl;
+    }
+    const result = await systemService.startMotionRecording(did, rtspUrl);
+    res.json({ did, ...result });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const stopCameraRecording = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { did } = req.params;
+    if (!did) {
+      res.status(400).json({ code: 'DID_REQUIRED', message: '缺少设备 DID' });
+      return;
+    }
+    const result = systemService.stopMotionRecording(did);
+    res.json({ did, ...result });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const getCameraRecordingStatus = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { did } = req.params;
+    if (!did) {
+      res.status(400).json({ code: 'DID_REQUIRED', message: '缺少设备 DID' });
+      return;
+    }
+    res.json({ did, recording: systemService.isMotionRecording(did) });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const listCameraRecordings = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { did } = req.params;
+    if (!did) {
+      res.status(400).json({ code: 'DID_REQUIRED', message: '缺少设备 DID' });
+      return;
+    }
+    res.json({ did, files: systemService.listMotionRecordings(did) });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const deleteCameraRecording = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { did, name } = req.params;
+    if (!did || !name) {
+      res.status(400).json({ code: 'DID_REQUIRED', message: '缺少设备 DID 或文件名' });
+      return;
+    }
+    res.json({ did, name, ...systemService.deleteMotionRecording(did, name) });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const listAllCameraRecordings = async (
+  _req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    res.json({ files: systemService.listAllCameraRecordings() });
   } catch (error) {
     next(error);
   }

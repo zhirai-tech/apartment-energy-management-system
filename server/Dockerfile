@@ -1,47 +1,42 @@
+# syntax=docker/dockerfile:1
+
+# ---------- 构建阶段 ----------
 FROM node:22-bookworm-slim AS builder
 
-RUN apt-get update -y && apt-get install -y --no-install-recommends openssl ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update -y \
+  && apt-get install -y --no-install-recommends openssl ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY server/package.json ./server/
-COPY server/tsconfig.json ./server/
+COPY server/package.json server/tsconfig.json ./server/
 COPY server/prisma ./server/prisma
 COPY server/src ./server/src
 COPY shared ./shared
 
 WORKDIR /app/server
 
-RUN npm install --production=false
+RUN npm install
 RUN npx prisma generate
 RUN npm run build
 
+# ---------- 运行阶段 ----------
 FROM node:22-bookworm-slim AS runner
 
-RUN apt-get update -y && apt-get install -y --no-install-recommends openssl ca-certificates && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-ENV NODE_ENV=production
-
-COPY server/package.json ./server/
-COPY server/prisma ./server/prisma
-COPY --from=builder /app/server/dist/server/src ./server/dist
-COPY --from=builder /app/server/dist/shared ./server/shared
-COPY --from=builder /app/server/node_modules ./server/node_modules
-COPY shared ./shared.orig
+RUN apt-get update -y \
+  && apt-get install -y --no-install-recommends openssl ca-certificates ffmpeg \
+  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app/server
 
-RUN npm install --production
-RUN npx prisma generate
+ENV NODE_ENV=production
 
-RUN mkdir -p /shared /app/shared \
-  && cp -rf /app/server/shared/* /shared/ 2>/dev/null || true \
-  && cp -rf /app/server/shared/* /app/shared/ 2>/dev/null || true \
-  && (cp /app/shared.orig/index.ts /shared/index.ts 2>/dev/null || true) \
-  && ls /shared 2>/dev/null || true
+COPY server/package.json server/tsconfig.json ./
+COPY server/prisma ./prisma
+COPY shared /app/shared
+COPY --from=builder /app/server/node_modules ./node_modules
+COPY --from=builder /app/server/dist ./dist
 
 EXPOSE 3001
 
-CMD ["sh", "-c", "npx prisma migrate deploy; npx prisma db seed 2>/dev/null; node dist/index.js"]
+CMD ["sh", "-c", "npx prisma migrate deploy && npx prisma db seed && node dist/server/src/index.js"]

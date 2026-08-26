@@ -10,10 +10,10 @@ import type {
   NetworkUsagePoint,
   WifiApRuntime,
 } from '@shared/index';
-import { DeviceStatus, DeviceCategory, inferDeviceCategory, networkGroupKey, pickPrimaryPublicNetworkDevice, publicNetworkPrimaryScore } from '@shared/index';
+import { DeviceStatus, DeviceCategory, inferDeviceCategory, networkGroupKey, normalizeMac, pickPrimaryPublicNetworkDevice, publicNetworkPrimaryScore } from '@shared/index';
 import { DeviceStatus as PrismaDeviceStatus } from '@prisma/client';
 import { DEFAULT_BUSINESS_TIMEZONE, addDays, getBusinessDate, getDateKey } from '../../lib/business-time';
-import { extractCameraRuntime, extractFiveGCpeRuntime, extractWifiApRuntime } from '../../lib/device-runtime';
+import { extractCameraRuntime, extractFiveGCpeRuntime, extractWifiApRuntime, OFFLINE_TO_UNCATEGORIZED_THRESHOLD_MS } from '../../lib/device-runtime';
 
 const PRISMA_TO_SHARED_DEVICE_STATUS: Record<PrismaDeviceStatus, DeviceStatus> =
   {
@@ -223,7 +223,8 @@ function pickModelText(modelValue: unknown): string {
   const raw = (typeof obj._raw === 'string' && obj._raw) ? obj._raw : '';
   const brand = (typeof obj.brand === 'string' && obj.brand) ? obj.brand : '';
   const vendor = (typeof obj.vendorName === 'string' && obj.vendorName) ? obj.vendorName : '';
-  return camModel || cpeModel || wifiModel || brand || camBrand || vendor || raw || modelValue;
+  const topModel = (typeof obj.model === 'string' && obj.model) ? obj.model : '';
+  return camModel || cpeModel || wifiModel || brand || camBrand || topModel || vendor || raw || modelValue;
 }
 
 async function toDeviceItem(d: any): Promise<DeviceItem> {
@@ -231,7 +232,12 @@ async function toDeviceItem(d: any): Promise<DeviceItem> {
   const parsedModel = tryParseJson(d.model);
   const macAddress = (parsedModel && typeof parsedModel.macAddress === 'string') ? parsedModel.macAddress : null;
   const rawMac = String(macAddress ?? '').trim().toUpperCase().replace(/[^A-F0-9]/g, '');
-  const ipAddress = (parsedModel && typeof parsedModel.ipAddress === 'string') ? parsedModel.ipAddress : null;
+  const ipAddress =
+    (parsedModel && typeof parsedModel.ipAddress === 'string' && parsedModel.ipAddress)
+      ? parsedModel.ipAddress
+      : (parsedModel && typeof parsedModel.localIp === 'string' && parsedModel.localIp)
+        ? parsedModel.localIp
+        : null;
   const vendorName =
     normalizeVendorName(parsedModel && typeof parsedModel.vendorName === 'string' ? parsedModel.vendorName : null) ??
     normalizeVendorName(parsedModel && typeof parsedModel.brand === 'string' ? parsedModel.brand : null);
@@ -240,13 +246,20 @@ async function toDeviceItem(d: any): Promise<DeviceItem> {
       ? (parsedModel.adapterConfig as Record<string, unknown>)
       : null;
   const modelText = pickModelText(d.model);
-  const category = inferDeviceCategory({
+  let category = inferDeviceCategory({
     name: d.name,
     model: modelText,
     vendor: vendorName,
     mac: rawMac.length === 12 ? rawMac : null,
     ip: ipAddress,
   });
+  // 手动分类优先于自动推断：设备被用户手动归类后，覆盖运行时推断结果
+  const manualCategory = parsedModel && typeof parsedModel.manualCategory === 'string'
+    ? (parsedModel.manualCategory as string).trim()
+    : '';
+  if (manualCategory && Object.values(DeviceCategory).includes(manualCategory as DeviceCategory)) {
+    category = manualCategory as DeviceCategory;
+  }
   const adapterHaystack = `${d.name ?? ''} ${vendorName ?? ''} ${modelText ?? ''}`.toLowerCase();
   const adapterKind =
     adapterConfig && (adapterConfig.kind === 'huawei_cpe' || adapterConfig.kind === 'nokia_beacon')
@@ -269,20 +282,26 @@ async function toDeviceItem(d: any): Promise<DeviceItem> {
   const stale = lastSyncTs > 0 && (Date.now() - lastSyncTs) > XIAOMI_STALE_OFFLINE_THRESHOLD_MS_DASHBOARD;
   let forceOffline = false;
   if (category === DeviceCategory.CAMERA) {
-    if (!isLanDiscovered && (!lastSyncTs || stale)) forceOffline = true;
+    // 仅对局域网/IP 摄像头按 lastSync 判定离线；米家云摄像头(isXiaomi)信任米家 API 写入的在线状态。
+    if (!isXiaomi && !isLanDiscovered && (!lastSyncTs || stale)) forceOffline = true;
   }
   if (isXiaomi && !forceOffline) {
     const loggedIn = await xiaomiAdapter.isLoggedIn(scope).catch(() => false);
     if (!loggedIn) forceOffline = true;
   }
-  // #region debug-point A:dashboard-camera-status
-  if (category === DeviceCategory.CAMERA) { try { const fs=require('fs'); let u='http://127.0.0.1:7778/event', s='camera-status-sync'; try { const e=fs.readFileSync('.dbg/camera-status-sync.env','utf8'); u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u; s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s; } catch {} fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:s,runId:'pre-fix',hypothesisId:'A',location:'dashboard.service.ts:toDeviceItem',msg:'[DEBUG] dashboard camera status evaluated',data:{did:d.did,name:d.name,dbStatus:d.status,lastSyncAt:d.lastSyncAt?new Date(d.lastSyncAt).toISOString():null,scope,isXiaomi,stale,forceOffline,parsedCameraOnline:parsedModel&&parsedModel.camera&&typeof parsedModel.camera==='object'?!!(parsedModel.camera as any).online:null}})}).catch(()=>{}); } catch {} }
-  // #endregion
   if (forceOffline && prismaStatus !== 'offline') {
     prismaStatus = 'offline';
   }
   const sharedStatus =
     PRISMA_TO_SHARED_DEVICE_STATUS[prismaStatus] ?? DeviceStatus.UNKNOWN;
+  // 离线超过 24 小时的设备运行时归入“未分类设备”，上线后自动恢复原分类。
+  // 仅在展示层覆盖 category，原 manualCategory / 自动分类结果仍保留，便于上线后还原。
+  if (sharedStatus === DeviceStatus.OFFLINE && d.offlineSince) {
+    const offlineSinceTs = new Date(d.offlineSince).getTime();
+    if (Number.isFinite(offlineSinceTs) && Date.now() - offlineSinceTs > OFFLINE_TO_UNCATEGORIZED_THRESHOLD_MS) {
+      category = DeviceCategory.OTHER;
+    }
+  }
   let cameraRuntime: DeviceItem['camera'] = extractCameraRuntime(parsedModel, prismaStatus);
   let wifiApRuntime: WifiApRuntime | null = extractWifiApRuntime(parsedModel);
   let fiveGCpeRuntime: FiveGCpeRuntime | null = extractFiveGCpeRuntime(parsedModel);
@@ -452,6 +471,41 @@ export async function getDashboardSummary(siteId?: string): Promise<DashboardSum
     });
     scored.sort((a, b) => b.score - a.score);
     const primary = scored[0]?.d;
+    if (!primary) continue;
+    for (const x of list) {
+      if (x.did !== primary.did) keepDids.delete(x.did);
+    }
+  }
+
+  // 摄像头去重：同一物理摄像头会同时被米家 API 与局域网扫描识别，
+  // 按 IP（其次 MAC）折叠，优先保留米家云设备、其次在线设备，避免重复卡片。
+  const cameraItems = rawDeviceItems.filter((d) => d.category === DeviceCategory.CAMERA);
+  const cameraGroups = new Map<string, DeviceItem[]>();
+  for (const c of cameraItems) {
+    const anyC = c as any;
+    const ip = String(anyC.ipAddress ?? anyC.ip ?? '').trim();
+    const mac = normalizeMac(anyC.mac ?? anyC.macAddress ?? null);
+    const key = ip ? `ip|${ip}` : mac ? `mac|${mac}` : `single|${c.did}`;
+    const arr = cameraGroups.get(key) ?? [];
+    arr.push(c);
+    cameraGroups.set(key, arr);
+  }
+  for (const [, list] of cameraGroups) {
+    if (list.length <= 1) continue;
+    const scored = list.map((c) => {
+      const anyC = c as any;
+      const ownership = String(anyC.ownership ?? '');
+      const source = String(anyC.source ?? '');
+      const isXiaomi = ownership === 'xiaomi' || source === 'account_sync';
+      const isLan = String(c.did ?? '').startsWith('LAN_') || source === 'lan_discovery';
+      let score = 0;
+      if (isXiaomi) score += 1000;
+      if (c.status === DeviceStatus.ONLINE) score += 100;
+      if (isLan) score -= 500;
+      return { c, score };
+    });
+    scored.sort((a, b) => b.score - a.score);
+    const primary = scored[0]?.c;
     if (!primary) continue;
     for (const x of list) {
       if (x.did !== primary.did) keepDids.delete(x.did);
