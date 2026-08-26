@@ -436,8 +436,9 @@ Recommended production deployment model:
 
 ## Contact
 
-- Email: [txq@zhinian-ai.com](mailto:txq@zhinian-ai.com)
-- QQ: `147594586`
+- 技术支持: [xtang3125@gmail.com](mailto:xtang3125@gmail.com)
+- QQ个人号: 2499174616
+- QQ个人号链接: https://qm.qq.com/q/1VBrKTDp0A
 
 ## License
 
