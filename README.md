@@ -436,10 +436,6 @@ Recommended production deployment model:
 
 ## Contact
 
-### Technical Support
-
-- [xtang3125@gmail.com](mailto:xtang3125@gmail.com)
-
 ### Business Contact
 
 - [txq@zhinian-ai.com](mailto:txq@zhinian-ai.com)

@@ -29,6 +29,16 @@ function write(dest, content) {
   fs.writeFileSync(dest, content, 'utf8');
 }
 
+// go2rtc 摄像头桥配置模板（脱敏，不含真实令牌/账号/IP）
+const go2rtcTemplate = `# go2rtc 摄像头桥配置（模板）
+# 安全提示：请勿在此提交真实的小米令牌/账号密码/摄像头IP。
+# 部署时按需填写你的摄像头接入信息，然后重启 go2rtc。
+
+streams:
+  # 小米摄像头示例（把 <账号> <密码> <摄像头IP> <设备ID> <型号> 替换为真实值）：
+  #   <设备ID>: xiaomi://<账号>:<密码>@<摄像头IP>?did=<设备ID>&model=<型号>
+`;
+
 // ---------- 清理 ----------
 rm(RELEASE);
 mkdir(RELEASE);
@@ -38,10 +48,10 @@ mkdir(RELEASE);
 // =====================================================================
 const C = path.join(RELEASE, 'zaem-container');
 mkdir(C);
-cpDir(path.join(ROOT, 'server'), path.join(C, 'server'), ['node_modules', 'dist', 'streams', 'recordings']);
+cpDir(path.join(ROOT, 'server'), path.join(C, 'server'), ['node_modules', 'dist', 'streams', 'recordings', '.env', 'generated']);
 cpDir(path.join(ROOT, 'client'), path.join(C, 'client'), ['node_modules', 'dist']);
 cpDir(path.join(ROOT, 'shared'), path.join(C, 'shared'));
-cpFile(path.join(ROOT, 'go2rtc', 'go2rtc.yaml'), path.join(C, 'go2rtc', 'go2rtc.yaml'));
+write(path.join(C, 'go2rtc', 'go2rtc.yaml'), go2rtcTemplate);
 cpFile(path.join(ROOT, 'docker-compose.yml'), path.join(C, 'docker-compose.yml'));
 cpFile(path.join(ROOT, '.dockerignore'), path.join(C, '.dockerignore'));
 
@@ -150,7 +160,7 @@ function buildNative(dirName, isWindows) {
   cpFile(path.join(ROOT, 'server', 'tsconfig.json'), path.join(N, 'server', 'tsconfig.json'));
   cpDir(path.join(ROOT, 'client', 'dist'), path.join(N, 'client', 'dist'));
   cpDir(path.join(ROOT, 'shared'), path.join(N, 'shared'));
-  cpFile(path.join(ROOT, 'go2rtc', 'go2rtc.yaml'), path.join(N, 'go2rtc', 'go2rtc.yaml'));
+  write(path.join(N, 'go2rtc', 'go2rtc.yaml'), go2rtcTemplate);
 
   write(path.join(N, 'server', '.env'), nativeEnv);
   write(path.join(N, 'docker-compose.db.yml'), dbCompose);
@@ -262,7 +272,7 @@ function sh(cmd) {
 
 try { sh(`tar -czf "${path.join(RELEASE, 'zaem-container.tar.gz')}" -C "${RELEASE}" zaem-container`); } catch (e) { console.warn('tar 压缩容器包失败：', e.message); }
 try { sh(`tar -czf "${path.join(RELEASE, 'zaem-linux.tar.gz')}" -C "${RELEASE}" zaem-linux`); } catch (e) { console.warn('tar 压缩 Linux 包失败：', e.message); }
-try { sh(`powershell -NoProfile -Command "Compress-Archive -Path '${path.join(RELEASE, 'zaem-windows')}\\*' -DestinationPath '${path.join(RELEASE, 'zaem-windows.zip')}' -Force"`); } catch (e) { console.warn('压缩 Windows 包失败：', e.message); }
+try { sh(`tar -c -f "${path.join(RELEASE, 'zaem-windows.zip')}" --format zip -C "${RELEASE}" zaem-windows`); } catch (e) { console.warn('压缩 Windows 包失败：', e.message); }
 
 console.log('\\n打包完成，产物位于：', RELEASE);
 for (const f of fs.readdirSync(RELEASE)) {
