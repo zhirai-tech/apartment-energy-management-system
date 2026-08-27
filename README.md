@@ -436,9 +436,9 @@ Recommended production deployment model:
 
 ## Contact
 
-- 技术支持: [xtang3125@gmail.com](mailto:xtang3125@gmail.com)
-- QQ个人号: 2499174616
-- QQ个人号链接: https://qm.qq.com/q/1VBrKTDp0A
+- Technical Support: [xtang3125@gmail.com](mailto:xtang3125@gmail.com)
+- QQ: 2499174616
+- QQ Link: https://qm.qq.com/q/1VBrKTDp0A
 
 ## License
 
