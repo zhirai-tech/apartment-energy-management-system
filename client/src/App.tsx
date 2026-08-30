@@ -14,8 +14,10 @@ import { SystemSettingsPage } from './pages/SystemSettingsPage';
 import { OperationLogsPage } from './pages/OperationLogsPage';
 import { AlarmCenterPage } from './pages/AlarmCenterPage';
 import { RecordingsPage } from './pages/RecordingsPage';
+import { CameraWallPage } from './pages/CameraWallPage';
 import { ForcePasswordChangePage } from './pages/ForcePasswordChangePage';
 import { NetworkDevicePage } from './pages/NetworkDevicePage';
+import { ExportPage } from './pages/ExportPage';
 
 function App() {
   return (
@@ -49,6 +51,8 @@ function App() {
             <Route path="logs/operations" element={<OperationLogsPage />} />
             <Route path="logs/alarms" element={<AlarmCenterPage />} />
             <Route path="recordings" element={<RecordingsPage />} />
+            <Route path="cameras" element={<CameraWallPage />} />
+            <Route path="export" element={<ExportPage />} />
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

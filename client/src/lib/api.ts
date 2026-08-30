@@ -28,6 +28,43 @@ const api = axios.create({
   timeout: 180_000,
 });
 
+// —— 并发相同 GET 请求合并：同一 URL 的在途请求直接复用其响应，
+//    消除页面加载时重复请求产生的浏览器 net::ERR_ABORTED 噪音 ——
+const inflightGets = new Map<string, Promise<unknown>>();
+const apiRequest = api.request.bind(api) as (config: any) => Promise<any>;
+api.request = ((config: any): Promise<any> => {
+  const cfg = config ?? {};
+  const method = String(cfg.method || 'get').toLowerCase();
+  const key = `${cfg.baseURL ?? ''}${cfg.url ?? ''}`;
+  if (method === 'get' && cfg.url) {
+    const inflight = inflightGets.get(key);
+    if (inflight) {
+      // 已有相同 GET 在途：等待其完成后返回相同数据，不再发起第二次网络请求
+      return inflight.then((payload) => ({
+        data: payload,
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        config: cfg,
+        request: {},
+      }));
+    }
+    const p = apiRequest(cfg).then(
+      (res: any) => {
+        inflightGets.delete(key);
+        return res.data;
+      },
+      (err: any) => {
+        inflightGets.delete(key);
+        throw err;
+      },
+    );
+    inflightGets.set(key, p);
+    return p;
+  }
+  return apiRequest(cfg);
+}) as typeof api.request;
+
 api.interceptors.request.use((config) => {
   const token = useAuthStore.getState().token;
   if (token) {
@@ -495,7 +532,7 @@ export const system = {
       sourceScope?: 'main' | 'camera';
     }>;
   }> => api.get('/system/xiaomi/camera/devices').then((res) => res.data),
-  getCameraStream: (did: string): Promise<{
+  getCameraStream: (did: string, opts?: { fresh?: boolean }): Promise<{
     ok: boolean;
     did: string;
     streamAddress?: string;
@@ -508,7 +545,8 @@ export const system = {
     startedAt?: string;
     ffmpegAvailable?: boolean;
     errorMessage?: string;
-  }> => api.get(`/system/device/${did}/camera_stream`).then((res) => res.data),
+  }> =>
+    api.get(`/system/device/${did}/camera_stream`, { params: opts?.fresh ? { cache: 'no-cache' } : undefined }).then((res) => res.data),
   controlCameraPTZ: (
     did: string,
     direction: 'left' | 'right' | 'up' | 'down' | 'stop' | 'calibrate',
@@ -521,16 +559,17 @@ export const system = {
     errorMessage?: string;
   }> =>
     api.post(`/system/device/${did}/camera_ptz`, { direction, speed }).then((res) => res.data),
-  startCameraRecording: (did: string): Promise<{
+  startCameraRecording: (did: string, opts?: { mode?: 'motion' | 'continuous'; segmentMinutes?: number }): Promise<{
     did: string;
     recording: boolean;
+    mode?: 'motion' | 'continuous';
     processId?: number;
     startedAt?: number;
     errorMessage?: string;
-  }> => api.post(`/system/device/${did}/camera_record/start`).then((res) => res.data),
+  }> => api.post(`/system/device/${did}/camera_record/start`, opts ?? {}).then((res) => res.data),
   stopCameraRecording: (did: string): Promise<{ did: string; recording: boolean }> =>
     api.post(`/system/device/${did}/camera_record/stop`).then((res) => res.data),
-  getCameraRecordingStatus: (did: string): Promise<{ did: string; recording: boolean }> =>
+  getCameraRecordingStatus: (did: string): Promise<{ did: string; recording: boolean; mode?: 'motion' | 'continuous' | null }> =>
     api.get(`/system/device/${did}/camera_record/status`).then((res) => res.data),
   listCameraRecordings: (did: string): Promise<{
     did: string;
@@ -545,6 +584,35 @@ export const system = {
   listAllCameraRecordings: (): Promise<{
     files: Array<{ did: string; name: string; size: number; mtime: number; url: string }>;
   }> => api.get('/system/camera/recordings').then((res) => res.data),
+  getCameraCapabilities: (did: string): Promise<CameraCapabilities> =>
+    api.get(`/system/device/${did}/camera_capabilities`).then((res) => res.data),
+  controlCameraCapability: (did: string, capability: string, value?: unknown): Promise<{
+    did: string;
+    capability: string;
+    ok: boolean;
+    state?: unknown;
+    hint?: string;
+  }> => api.post(`/system/device/${did}/camera_control`, { capability, value }).then((res) => res.data),
+  getCameraMotionSettings: (): Promise<{ threshold: number; tailSeconds: number; ringSeconds: number }> =>
+    api.get('/system/camera/motion-settings').then((res) => res.data),
+  updateCameraMotionSettings: (data: { threshold?: number; tailSeconds?: number; ringSeconds?: number }): Promise<{
+    threshold: number;
+    tailSeconds: number;
+    ringSeconds: number;
+  }> => api.put('/system/camera/motion-settings', data).then((res) => res.data),
+  listCameraSchedules: (did?: string): Promise<{ schedules: CameraScheduleRule[] }> =>
+    api.get('/system/camera/schedules', { params: did ? { did } : undefined }).then((res) => res.data),
+  upsertCameraSchedule: (data: {
+    id?: string;
+    did: string;
+    enabled?: boolean;
+    mode?: 'motion' | 'continuous';
+    days?: number[];
+    start?: string;
+    end?: string;
+  }): Promise<{ rule: CameraScheduleRule }> => api.post('/system/camera/schedules', data).then((res) => res.data),
+  deleteCameraSchedule: (id: string): Promise<{ deleted: boolean }> =>
+    api.delete(`/system/camera/schedules/${encodeURIComponent(id)}`).then((res) => res.data),
   getDeviceAdapterConfig: (did: string): Promise<{
     kind: 'huawei_cpe' | 'nokia_beacon' | null;
     baseUrl: string | null;
@@ -571,6 +639,36 @@ export const system = {
     runtime?: any;
     errorMessage?: string;
   }> => api.get(`/system/device/${did}/refresh_runtime`).then((res) => res.data),
+  // ── Generic local-LAN device control (HTTP / Modbus / Tuya / MiIO) ──
+  getDeviceControlConfig: (did: string): Promise<{
+    did: string;
+    name?: string;
+    localip?: string | null;
+    controlProtocol?: string | null;
+    controlConfig?: any;
+  }> => api.get(`/system/device/${did}/control-config`).then((res) => res.data),
+  updateDeviceControlConfig: (did: string, data: {
+    localip?: string | null;
+    controlProtocol?: string | null;
+    controlConfig?: any;
+  }): Promise<{
+    ok: boolean;
+    did: string;
+    localip: string | null;
+    controlProtocol: string | null;
+    name?: string;
+  }> => api.put(`/system/device/${did}/control-config`, data).then((res) => res.data),
+  testDeviceControlConfig: (did: string, data: {
+    localip?: string;
+    controlProtocol?: string;
+    controlConfig?: any;
+    action?: 'on' | 'off';
+  }): Promise<{
+    ok: boolean;
+    mode?: string;
+    action?: string;
+    state?: { on?: boolean | null; powerW?: number | null; reachable?: boolean; error?: string };
+  }> => api.post(`/system/device/${did}/control-config/test`, data).then((res) => res.data),
 };
 
 export const logs = {
@@ -582,6 +680,81 @@ export const logs = {
     api.delete('/logs/alarms', { data }).then((res) => res.data),
   resolveAlarm: (id: string): Promise<any> =>
     api.post(`/logs/alarms/${id}/resolve`).then((res) => res.data),
+};
+
+// ──────────────── 数据导出 ────────────────
+
+function dateStamp(): string {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+async function downloadCsv(filename: string, url: string, params?: object): Promise<void> {
+  const res = await api.get(url, { params, responseType: 'blob', timeout: 120_000 });
+  const blob = res.data as Blob;
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = objectUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+}
+
+export interface ExportQuery {
+  siteId?: string;
+  from?: string;
+  to?: string;
+  category?: string;
+}
+
+export interface CameraCapabilityState {
+  supported: boolean;
+  controllable: boolean;
+  state?: boolean | string | number | null;
+  hint?: string;
+}
+
+export interface CameraCapabilities {
+  did: string;
+  controlMode: 'xiaomi-cloud' | 'local' | 'none';
+  ptz: CameraCapabilityState & { calibrate: boolean; directions: string[] };
+  nightVision: CameraCapabilityState;
+  audio: CameraCapabilityState;
+  humanDetection: CameraCapabilityState;
+  motionDetection: CameraCapabilityState;
+  faceRecognition: CameraCapabilityState;
+  privacy: CameraCapabilityState;
+  recording: CameraCapabilityState;
+  snapshot: CameraCapabilityState;
+  fetchedAt: number;
+}
+
+export interface CameraScheduleRule {
+  id: string;
+  did: string;
+  enabled: boolean;
+  mode: 'motion' | 'continuous';
+  days: number[]; // 0=周日…6=周六
+  start: string;
+  end: string;
+}
+
+export const exportData = {
+  /** 每个房间的用电汇总（实时功率/累计/今日/昨日/本周/本月/本年/费用/限额） */
+  energySummary: (params: { siteId?: string } = {}): Promise<void> =>
+    downloadCsv(`zhirai-用电汇总-${dateStamp()}.csv`, '/export/energy-summary', params),
+  /** 每个房间逐日用电（日期范围，默认最近 30 天） */
+  energyDaily: (params: ExportQuery = {}): Promise<void> =>
+    downloadCsv(`zhirai-逐日用电-${dateStamp()}.csv`, '/export/energy-daily', params),
+  /** 每个房间每周用电（按周一到周日，日期范围，默认最近 8 周） */
+  energyWeekly: (params: ExportQuery = {}): Promise<void> =>
+    downloadCsv(`zhirai-每周用电-${dateStamp()}.csv`, '/export/energy-weekly', params),
+  /** 设备/系统操作记录 */
+  operations: (params: ExportQuery = {}): Promise<void> =>
+    downloadCsv(`zhirai-操作记录-${dateStamp()}.csv`, '/export/operations', params),
 };
 
 export type { DeviceItem };

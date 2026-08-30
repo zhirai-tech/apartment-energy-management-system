@@ -1,4 +1,4 @@
-import { FiveGCpeRuntime, WifiApRuntime, DeviceCategory } from '@shared/index';
+import { FiveGCpeRuntime, WifiApRuntime } from '@shared/index';
 
 // 设备离线超过该时长后，仪表盘运行时将其归类为“未分类设备”（上线后自动恢复原分类）。
 export const OFFLINE_TO_UNCATEGORIZED_THRESHOLD_MS = 24 * 60 * 60 * 1000;
@@ -75,7 +75,7 @@ export interface DeviceCameraRuntime {
   lastMotionAt: string | null;
 }
 
-export interface CameraCapabilities {
+interface CameraCapabilities {
   hasAudio?: boolean;
   hasNightVision?: boolean;
   hasMotion?: boolean;
@@ -160,21 +160,4 @@ export function extractCameraRuntime(
     hasPTZ: boolOf((c as any).hasPTZ) ?? caps.hasPTZ,
     lastMotionAt: typeof (c as any).lastMotionAt === 'string' ? (c as any).lastMotionAt : null,
   };
-}
-
-export function deviceMatchesCategory(
-  parsedModel: ParsedModelLike | null | undefined,
-  category: DeviceCategory | string,
-): boolean {
-  if (!parsedModel) return false;
-  switch (String(category)) {
-    case String(DeviceCategory.CAMERA):
-      return !!getSubObject(parsedModel, 'camera');
-    case String(DeviceCategory.WIFI_AP):
-      return !!extractWifiApRuntime(parsedModel);
-    case String(DeviceCategory.FIVE_G_CPE):
-      return !!extractFiveGCpeRuntime(parsedModel);
-    default:
-      return false;
-  }
 }

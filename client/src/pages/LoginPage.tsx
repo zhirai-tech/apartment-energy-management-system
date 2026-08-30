@@ -1,5 +1,6 @@
 import { useState, useEffect, type FormEvent, type ChangeEvent } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
+import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Input } from '../components/ui/input';
@@ -13,6 +14,7 @@ import type { LoginRequest } from '../types';
 export function LoginPage() {
   const navigate = useNavigate();
   const location = useLocation();
+  const queryClient = useQueryClient();
   const setAuth = useAuthStore((state) => state.setAuth);
   const logout = useAuthStore((state) => state.logout);
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
@@ -58,6 +60,8 @@ export function LoginPage() {
       const res = await auth.login(form);
       const credentials = remember ? { username: form.username, password: form.password } : undefined;
       setAuth(res.token, res.user, remember, credentials);
+      // 登录成功即清空查询缓存，确保进入首页时所有数据从服务器重新拉取最新值
+      queryClient.clear();
       try {
         if (remember) {
           localStorage.setItem('zaem_remember_me', '1');

@@ -30,3 +30,16 @@ server/streams/
 go2rtc/go2rtc.exe
 go2rtc/go2rtc_win64.zip
 go2rtc/go2rtc.yaml
+
+# 部署凭据 / 私密 URL / 构建产物 / 数据导出（切勿提交）
+deploy/remote.env
+deploy/hlsurl.txt
+deploy/*.tar.gz
+deploy/*.log
+deploy/archive/
+deploy/system.service.js
+deploy/probe-dist.js
+server-dist.tar.gz
+client-dist.tar.gz
+zaem-dump.sql
+deploy_run.log

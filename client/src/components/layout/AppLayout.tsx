@@ -10,6 +10,8 @@ import {
   LogOut,
   Menu,
   Film,
+  MonitorPlay,
+  FileDown,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { Button } from '../ui/button';
@@ -28,6 +30,8 @@ const menuItems = [
   { to: '/logs/operations', icon: List, label: '操作日志' },
   { to: '/logs/alarms', icon: Bell, label: '报警中心' },
   { to: '/recordings', icon: Film, label: '录像回放' },
+  { to: '/cameras', icon: MonitorPlay, label: '监控墙' },
+  { to: '/export', icon: FileDown, label: '数据导出' },
 ];
 
 export function AppLayout() {
