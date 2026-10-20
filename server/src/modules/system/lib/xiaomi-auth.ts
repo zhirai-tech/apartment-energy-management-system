@@ -23,7 +23,7 @@ export interface XiaomiSession {
 }
 
 export interface XiaomiAuthStatus {
-  state: 'idle' | 'logged_in' | 'challenge_required' | 'error';
+  state: 'idle' | 'logged_in' | 'challenge_required' | 'error' | 'recovering';
   needsVerification: boolean;
   verificationMethod?: 'browser' | 'email_code' | 'mobile_code' | null;
   message?: string;

@@ -3,6 +3,8 @@ import { UserRole } from '@prisma/client';
 import { authenticate, requireRole } from '../../middleware/auth';
 import {
   getSettings,
+  getRemoteAccessInfo,
+  renewRemoteAccess,
   getSites,
   createSite,
   updateSite,
@@ -12,14 +14,19 @@ import {
   xiaomiDevices,
   xiaomiLogin,
   xiaomiSync,
+  syncXiaomiLocalTokens,
   controlDevice,
   renameDevice,
   updateRoomAnnotation,
   updateRoomFloor,
   bulkControlDevices,
   lanScan,
+  listLanScanHistory,
+  clearLanScanHistory,
   detectLanSubnet,
   persistLanDevices,
+  lanDeviceProbe,
+  manualAddDevice,
   getDeviceSnapshot,
   updateDeviceCamera,
   updateDeviceCategory,
@@ -52,8 +59,40 @@ import {
   updateDeviceControlConfig,
   testDeviceControlConfig,
 } from './system.controller';
+import {
+  listCameras,
+  discoverLanCameras,
+  probeLanCamera,
+  createLanCamera,
+  updateLanCamera,
+  deleteLanCamera,
+  testLanCamera,
+  getLanCameraConfigDetail,
+  getLanCameraFeatures,
+  updateLanCameraFeatures,
+  controlLanCameraPtz,
+  getLanCameraPtzPresets,
+  getLanCameraDetections,
+  setLanCameraDetection,
+} from './lan-camera.controller';
 
 const router = Router();
+
+// ─── 统一摄像头管理（局域网 ONVIF/RTSP + 米家云） ───
+router.get('/cameras', authenticate, listCameras);
+router.post('/cameras/discover', authenticate, requireRole(UserRole.admin, UserRole.boss), discoverLanCameras);
+router.post('/cameras/probe', authenticate, requireRole(UserRole.admin, UserRole.boss), probeLanCamera);
+router.post('/cameras/lan', authenticate, requireRole(UserRole.admin, UserRole.boss), createLanCamera);
+router.put('/cameras/lan/:did', authenticate, requireRole(UserRole.admin, UserRole.boss), updateLanCamera);
+router.get('/cameras/lan/:did/config', authenticate, requireRole(UserRole.admin, UserRole.boss), getLanCameraConfigDetail);
+router.get('/cameras/lan/:did/features', authenticate, getLanCameraFeatures);
+router.put('/cameras/lan/:did/features', authenticate, requireRole(UserRole.admin, UserRole.boss), updateLanCameraFeatures);
+router.post('/cameras/lan/:did/test', authenticate, requireRole(UserRole.admin, UserRole.boss), testLanCamera);
+router.post('/cameras/lan/:did/ptz', authenticate, requireRole(UserRole.admin, UserRole.boss), controlLanCameraPtz);
+router.get('/cameras/lan/:did/ptz/presets', authenticate, getLanCameraPtzPresets);
+router.get('/cameras/lan/:did/detections', authenticate, getLanCameraDetections);
+router.post('/cameras/lan/:did/detections', authenticate, requireRole(UserRole.admin, UserRole.boss), setLanCameraDetection);
+router.delete('/cameras/lan/:did', authenticate, requireRole(UserRole.admin, UserRole.boss), deleteLanCamera);
 
 router.get('/settings', authenticate, getSettings);
 router.get('/sites', authenticate, getSites);
@@ -62,8 +101,15 @@ router.put('/sites/:siteId', authenticate, requireRole(UserRole.admin), updateSi
 router.put('/settings', authenticate, requireRole(UserRole.admin, UserRole.boss), updateSettings);
 router.post('/settings/price-reference/refresh', authenticate, requireRole(UserRole.admin, UserRole.boss), refreshReferencePrice);
 router.post('/lan-scan', authenticate, requireRole(UserRole.admin, UserRole.boss), lanScan);
+router.get('/lan-scans', authenticate, listLanScanHistory);
+router.delete('/lan-scans', authenticate, requireRole(UserRole.admin, UserRole.boss), clearLanScanHistory);
 router.get('/lan-scan/subnets', authenticate, detectLanSubnet);
+// ─── 远程访问（外网 cloudflared 隧道地址） ───
+router.get('/remote-access', authenticate, getRemoteAccessInfo);
+router.post('/remote-access/renew', authenticate, requireRole(UserRole.admin, UserRole.boss), renewRemoteAccess);
+router.post('/lan-scan/probe', authenticate, requireRole(UserRole.admin, UserRole.boss), lanDeviceProbe);
 router.post('/lan-device/persist', authenticate, requireRole(UserRole.admin, UserRole.boss), persistLanDevices);
+router.post('/device/manual', authenticate, requireRole(UserRole.admin, UserRole.boss), manualAddDevice);
 router.get('/device/:did/snapshot', authenticate, getDeviceSnapshot);
 router.put('/device/:did/camera', authenticate, requireRole(UserRole.admin, UserRole.boss), updateDeviceCamera);
 router.put('/device/:did/category', authenticate, requireRole(UserRole.admin, UserRole.boss), updateDeviceCategory);
@@ -81,6 +127,7 @@ router.get('/xiaomi/devices', authenticate, xiaomiDevices);
 router.post('/xiaomi/login', authenticate, requireRole(UserRole.admin), xiaomiLogin);
 router.post('/xiaomi/login/continue', authenticate, requireRole(UserRole.admin), xiaomiLogin);
 router.post('/xiaomi/sync', authenticate, requireRole(UserRole.admin), xiaomiSync);
+router.post('/xiaomi/local/sync-breakers', authenticate, requireRole(UserRole.admin, UserRole.boss), syncXiaomiLocalTokens);
 // ─── MiOT dual session: camera region (independent EU account) ───
 router.get('/xiaomi/camera/status', authenticate, requireRole(UserRole.admin), xiaomiCameraStatus);
 router.post('/xiaomi/camera/login', authenticate, requireRole(UserRole.admin), xiaomiCameraLogin);

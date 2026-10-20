@@ -43,3 +43,16 @@ server-dist.tar.gz
 client-dist.tar.gz
 zaem-dump.sql
 deploy_run.log
+# 本机部署脚本与敏感信息（不提交）
+deploy/remote/
+deploy/ssh-helper.ps1
+deploy/*.tar.gz
+*.tar.gz
+server-dist.tar.gz
+zaem-dump.sql
+TUNNEL.md
+docs/images/
+
+# 本地部署脚本（含本机地址/凭据，不提交）
+deploy/
+

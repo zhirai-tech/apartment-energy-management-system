@@ -17,6 +17,7 @@ import { RecordingsPage } from './pages/RecordingsPage';
 import { CameraWallPage } from './pages/CameraWallPage';
 import { ForcePasswordChangePage } from './pages/ForcePasswordChangePage';
 import { NetworkDevicePage } from './pages/NetworkDevicePage';
+import { NetworkDevicesPage } from './pages/NetworkDevicesPage';
 import { ExportPage } from './pages/ExportPage';
 
 function App() {
@@ -47,7 +48,7 @@ function App() {
             <Route path="rooms/:roomId" element={<RoomDetailPage />} />
             <Route path="energy-limits" element={<EnergyLimitsPage />} />
             <Route path="system" element={<SystemSettingsPage />} />
-            <Route path="network-devices/:did" element={<NetworkDevicePage />} />
+            <Route path="network-devices" element={<NetworkDevicesPage />} />`r`n            <Route path="network-devices/:did" element={<NetworkDevicePage />} />
             <Route path="logs/operations" element={<OperationLogsPage />} />
             <Route path="logs/alarms" element={<AlarmCenterPage />} />
             <Route path="recordings" element={<RecordingsPage />} />

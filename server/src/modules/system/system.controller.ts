@@ -1,11 +1,16 @@
 import { Request, Response, NextFunction } from 'express';
+import fs from 'node:fs';
+import path from 'node:path';
+import { execSync } from 'node:child_process';
 import { SystemSettingsData } from '@shared/index';
 import { systemService } from './system.service';
 import { xiaomiAdapter } from './xiaomi.adapter';
 import { XIAOMI_USERNAME, XIAOMI_PASSWORD } from '../../config/env';
 import { getOperationActorContextFromRequest } from '../../lib/request-context';
-import { scanLanDevices, detectLanSubnets } from '../../lib/lan-scan';
+import { scanLanDevices, detectLanSubnets, probeLanDevicesDetailed } from '../../lib/lan-scan';
 import { AppError } from '../../lib/errors';
+import { lanCameraService } from './lan-camera.service';
+import { probeOnvifDevice } from './lib/onvif';
 
 // 从 device.model JSON 解析米家云摄像头真实 DID 与会话区；
 // 局域网扫描到的摄像头主键是 LAN_ 前缀，米家 API 需要数字 DID（model.xiaomiDid）。
@@ -38,6 +43,165 @@ export const getSettings = async (
     res.json(settings);
   } catch (error) {
     next(error);
+  }
+};
+
+/** 读取 cloudflared quick tunnel 日志，返回最新的 trycloudflare 公网地址 */
+function findLatestTunnelUrl(): { url: string; mtime: number } | null {
+  const dir = process.env.CLOUDFLARED_DIR || 'C:\\zaem\\cloudflared';
+  if (!fs.existsSync(dir)) return null;
+  let newest: { url: string; mtime: number } | null = null;
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.startsWith('quick-tunnel')) continue;
+      const full = path.join(dir, name);
+      try {
+        const st = fs.statSync(full);
+        if (!st.isFile()) continue;
+        const text = fs.readFileSync(full, 'utf8');
+        const matches = text.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/g);
+        if (matches && matches.length > 0) {
+          const url = matches[matches.length - 1];
+          if (!newest || st.mtimeMs > newest.mtime) newest = { url, mtime: st.mtimeMs };
+        }
+      } catch {
+        /* 忽略单个日志文件读取失败 */
+      }
+    }
+  } catch {
+    return null;
+  }
+  return newest;
+}
+
+function isCloudflaredRunning(): boolean {
+  try {
+    const out = execSync('tasklist /FI "IMAGENAME eq cloudflared.exe"', {
+      encoding: 'utf8',
+      timeout: 2000,
+      windowsHide: true,
+    });
+    return out.toLowerCase().includes('cloudflared.exe');
+  } catch {
+    return false;
+  }
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+let remoteAccessRenewing = false;
+
+/**
+ * 远程访问（外网）信息：读取 cloudflared quick tunnel 当前地址。
+ * 手机/外网访问本系统时使用该地址；隧道重启后地址可能变化，前端点「更新」重新申请即可。
+ */
+export const getRemoteAccessInfo = async (
+  _req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const latest = findLatestTunnelUrl();
+    const running = isCloudflaredRunning();
+    const enabled = !!(latest && running);
+    res.json({
+      enabled,
+      url: enabled ? latest!.url : null,
+      provider: 'cloudflared',
+      checkedAt: new Date().toISOString(),
+      ...(enabled ? {} : { hint: '未检测到 cloudflared 隧道（或隧道未运行），可点击「更新」重新申请外网地址。' }),
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * 重新申请外网地址：重启 zaem-tunnel 服务（cloudflared quick tunnel），
+ * 等待其生成新的 trycloudflare 地址并返回。用于停电/服务器重启后地址失效的场景。
+ */
+export const renewRemoteAccess = async (
+  _req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  if (process.platform !== 'win32') {
+    res.status(400).json({
+      ok: false,
+      enabled: false,
+      url: null,
+      provider: 'cloudflared',
+      checkedAt: new Date().toISOString(),
+      hint: '仅支持 Windows 服务器',
+    });
+    return;
+  }
+  if (remoteAccessRenewing) {
+    res.status(409).json({
+      ok: false,
+      enabled: false,
+      url: null,
+      provider: 'cloudflared',
+      checkedAt: new Date().toISOString(),
+      hint: '正在更新外网地址，请稍候再试',
+    });
+    return;
+  }
+  remoteAccessRenewing = true;
+  try {
+    const previousTunnelUrl = findLatestTunnelUrl()?.url ?? null;
+    try {
+      execSync('sc.exe stop zaem-tunnel', { timeout: 30000, windowsHide: true });
+    } catch {
+      /* 服务可能已经停止 */
+    }
+    for (let i = 0; i < 30; i += 1) {
+      await sleep(1000);
+      try {
+        const q = execSync('sc.exe query zaem-tunnel', {
+          encoding: 'utf8',
+          timeout: 3000,
+          windowsHide: true,
+        });
+        if (/STOPPED/.test(q)) break;
+      } catch {
+        break;
+      }
+    }
+    try {
+      execSync('sc.exe start zaem-tunnel', { timeout: 30000, windowsHide: true });
+    } catch (err: any) {
+      throw new Error(`启动外网隧道服务失败：${err?.message || err}`);
+    }
+    let url: string | null = null;
+    const previousUrl = previousTunnelUrl;
+    for (let i = 0; i < 75; i += 1) {
+      await sleep(1000);
+      const latest = findLatestTunnelUrl();
+      if (!latest) continue;
+      // quick tunnel 重启后一定会分配新地址；等到新地址出现才返回，避免把旧地址当成"更新成功"
+      if (latest.url !== previousUrl) {
+        url = latest.url;
+        break;
+      }
+    }
+    if (!url) {
+      const latest = findLatestTunnelUrl();
+      if (latest && latest.url !== previousUrl && isCloudflaredRunning()) url = latest.url;
+    }
+    if (!url) {
+      throw new Error('外网隧道已重启，但暂时没拿到新地址，请稍后再点一次「更新」');
+    }
+    res.json({
+      ok: true,
+      enabled: true,
+      url,
+      provider: 'cloudflared',
+      checkedAt: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    next(new AppError(500, 'REMOTE_ACCESS_RENEW_FAILED', error?.message || '更新外网地址失败'));
+  } finally {
+    remoteAccessRenewing = false;
   }
 };
 
@@ -128,6 +292,85 @@ export const refreshReferencePrice = async (
       writeOperationLog: true,
     });
     res.json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ──────────────── 局域网设备详情探测（端口 / 品牌 / 类型 / MiIO 能力） ────────────────
+export const lanDeviceProbe = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const body = (req.body ?? {}) as {
+      items?: Array<{ ip: string; mac?: string | null; vendor?: string | null; name?: string | null; hostname?: string | null }>;
+      ips?: string[];
+    };
+    const items: Array<{ ip: string; mac?: string | null; vendor?: string | null; name?: string | null; hostname?: string | null }> = [];
+    if (Array.isArray(body.items)) {
+      for (const item of body.items) {
+        if (item && typeof item.ip === 'string' && item.ip.trim()) {
+          items.push({
+            ip: item.ip.trim(),
+            mac: item.mac ?? null,
+            vendor: item.vendor ?? null,
+            name: item.name ?? null,
+            hostname: item.hostname ?? null,
+          });
+        }
+      }
+    } else if (Array.isArray(body.ips)) {
+      for (const ip of body.ips) {
+        if (typeof ip === 'string' && ip.trim()) items.push({ ip: ip.trim() });
+      }
+    }
+    if (items.length === 0) {
+      res.status(400).json({ code: 'ITEMS_REQUIRED', message: '请提供要探测的设备 IP 列表' });
+      return;
+    }
+    if (items.length > 128) {
+      res.status(400).json({ code: 'TOO_MANY_ITEMS', message: '一次最多探测 128 台设备' });
+      return;
+    }
+    const devices = await probeLanDevicesDetailed(items);
+    res.json({ total: devices.length, devices });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ──────────────── 手动添加设备（统一添加设备向导） ────────────────
+export const manualAddDevice = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const body = (req.body ?? {}) as {
+      name?: string;
+      ip?: string;
+      mac?: string | null;
+      category?: string;
+      vendor?: string | null;
+      model?: string | null;
+      roomId?: string | null;
+    };
+    const result = await systemService.upsertManualDevice(
+      {
+        name: String(body.name ?? ''),
+        ip: String(body.ip ?? ''),
+        mac: body.mac ?? null,
+        category: String(body.category ?? ''),
+        vendor: body.vendor ?? null,
+        model: body.model ?? null,
+        roomId: typeof body.roomId === 'string' ? body.roomId : null,
+      },
+      req.user?.id ?? null,
+      getOperationActorContextFromRequest(req),
+    );
+    res.status(201).json(result);
   } catch (error) {
     next(error);
   }
@@ -829,6 +1072,91 @@ export const detectLanSubnet = async (
   }
 };
 
+// ─── LAN 扫描历史：每次扫描落库一条记录，随时回看/补加设备 ───
+const LAN_SCAN_HISTORY_KEY = 'lan_scan_history';
+const LAN_SCAN_HISTORY_MAX = 20;
+
+async function recordLanScanHistory(subnet: string, result: any): Promise<void> {
+  const entry = {
+    id: `scan_${Date.now()}`,
+    scannedAt: new Date().toISOString(),
+    subnet,
+    deviceCount: Array.isArray(result?.devices) ? result.devices.length : 0,
+    aliveCount: Number(result?.aliveCount ?? 0),
+    arpCount: Number(result?.arpCount ?? 0),
+    devices: Array.isArray(result?.devices) ? result.devices : [],
+  };
+  await systemService.prismaWrap(async (p) => {
+    const existing = await p.systemSettings.findUnique({
+      where: { key: LAN_SCAN_HISTORY_KEY },
+      select: { value: true },
+    });
+    let list: any[] = [];
+    if (existing?.value) {
+      try {
+        const parsed = JSON.parse(existing.value);
+        if (Array.isArray(parsed)) list = parsed;
+      } catch {
+        list = [];
+      }
+    }
+    const next = [entry, ...list].slice(0, LAN_SCAN_HISTORY_MAX);
+    const serialized = JSON.stringify(next);
+    await p.systemSettings.upsert({
+      where: { key: LAN_SCAN_HISTORY_KEY },
+      create: {
+        key: LAN_SCAN_HISTORY_KEY,
+        value: serialized,
+        description: '局域网扫描历史记录（最近 20 次）',
+      },
+      update: { value: serialized },
+    });
+  });
+}
+
+export const listLanScanHistory = async (
+  _req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const row = await systemService.prismaWrap(async (p) =>
+      p.systemSettings.findUnique({ where: { key: LAN_SCAN_HISTORY_KEY }, select: { value: true } }),
+    );
+    let items: any[] = [];
+    if (row?.value) {
+      try {
+        const parsed = JSON.parse(row.value);
+        if (Array.isArray(parsed)) items = parsed;
+      } catch {
+        items = [];
+      }
+    }
+    res.json({ items });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const clearLanScanHistory = async (
+  _req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    await systemService.prismaWrap(async (p) =>
+      p.systemSettings.upsert({
+        where: { key: LAN_SCAN_HISTORY_KEY },
+        create: { key: LAN_SCAN_HISTORY_KEY, value: '[]', description: '局域网扫描历史记录（最近 20 次）' },
+        update: { value: '[]' },
+      }),
+    );
+    res.json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
+};
+
 export const lanScan = async (
   req: Request,
   res: Response,
@@ -882,6 +1210,13 @@ export const lanScan = async (
       concurrency: typeof concurrency === 'number' && concurrency > 0 ? concurrency : undefined,
       abortSignal: controller.signal,
     });
+
+    // 扫描一次记录一次（失败不影响扫描结果返回）
+    try {
+      await recordLanScanHistory(subnet.trim(), result);
+    } catch (historyError) {
+      console.warn('[lan-scan] 保存扫描记录失败:', (historyError as Error)?.message);
+    }
 
     clearTimeout(hardTimeout);
     if (finished) return;
@@ -1300,6 +1635,29 @@ export const getCameraStream = async (
     );
     const model = device?.model ?? '';
     const name = device?.name ?? '';
+    // 局域网（ONVIF/RTSP）摄像头：本地 ffmpeg HLS 代理，完全不依赖小米云
+    const lanConfig = await lanCameraService.getLanCameraConfig(did).catch(() => null);
+    if (lanConfig) {
+      const lanStream = await lanCameraService.ensureLanCameraStream(did, {
+        fresh: String(req.query.cache ?? '') === 'no-cache',
+      });
+      res.json({
+        did,
+        name,
+        model: lanConfig.model ?? lanConfig.brand ?? 'LAN Camera',
+        streamAddress: lanStream.rtspUrl,
+        streamAuthToken: '',
+        rtspUrl: lanStream.rtspUrl,
+        hlsUrl: lanStream.hlsUrl,
+        hlsReady: lanStream.hlsReady,
+        proxyMode: lanStream.proxyMode,
+        startedAt: lanStream.startedAt,
+        processId: lanStream.processId,
+        ffmpegAvailable: lanStream.ffmpegAvailable,
+        errorMessage: lanStream.errorMessage,
+      });
+      return;
+    }
     // 米家云摄像头需使用其数字 DID（存储在 model.xiaomiDid），而非局域网 LAN_ 前缀主键
     const xiaomiDevice = resolveXiaomiDeviceRef(model, did);
     // cache=no-cache：前端重连时强制新建云端会话，避免复用已失效的 HLS URL
@@ -1333,6 +1691,8 @@ export const getCameraStream = async (
       }
       // go2rtc 本地桥拉流失败 → 落到云端路径
       console.warn('[CameraStream] go2rtc bridge did not produce live HLS, did=', did);
+      // 停掉局域网代理，避免它与下方云端代理同时写同一个 HLS 目录互相覆盖
+      systemService.stopCameraStreamProxy(did);
     }
     // ② 云端 HLS 本地代理（Google Home 转码流）：
     //    服务端用 ffmpeg 持续拉云端 HLS 并重切为本地稳定流（streams/hls/<did>/stream.m3u8），
@@ -1340,6 +1700,8 @@ export const getCameraStream = async (
     try {
       const proxy = await systemService.ensureCloudHlsProxy(xiaomiDevice.did, xiaomiDevice.scope);
       if (proxy.hlsUrl) {
+        // hlsReady=false 时不下发 hlsUrl：避免前端请求一个已不存在的 m3u8（404），
+        // 前端据此显示"视频流正在恢复"并继续轮询，后端代理会在后台自愈。
         res.json({
           did,
           model,
@@ -1347,13 +1709,14 @@ export const getCameraStream = async (
           streamAddress: '',
           streamAuthToken: '',
           rtspUrl: '',
-          hlsUrl: proxy.hlsUrl,
+          hlsUrl: proxy.hlsReady ? proxy.hlsUrl : null,
           webrtcUrl: null,
           hlsReady: proxy.hlsReady,
           proxyMode: proxy.proxyMode,
           startedAt: null,
           processId: null,
           ffmpegAvailable: true,
+          errorMessage: proxy.hlsReady ? undefined : (proxy.errorMessage ?? '视频流正在恢复'),
         });
         return;
       }
@@ -1469,6 +1832,43 @@ export const getCameraMiotToken = async (
   }
 };
 
+// ──────────────── 米家空开本地化：同步局域网 Token ────────────────
+export const syncXiaomiLocalTokens = async (
+  _req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const devices = await xiaomiAdapter.fetchDeviceTokens();
+    let updated = 0;
+    const skipped: Array<{ did: string; name: string; reason: string }> = [];
+    for (const item of devices) {
+      if (!item.ip) {
+        skipped.push({ did: item.did, name: item.name, reason: '没有局域网 IP' });
+        continue;
+      }
+      const result = await systemService.prismaWrap(async (p) =>
+        p.device.updateMany({
+          where: { did: item.did },
+          data: {
+            localip: item.ip,
+            controlProtocol: 'miio_lan',
+            controlConfig: { miioToken: item.token },
+            controlUpdatedAt: new Date(),
+          },
+        }),
+      );
+      if (result.count > 0) updated += result.count;
+      else skipped.push({ did: item.did, name: item.name, reason: '系统里还没有这台设备（请先同步米家设备）' });
+    }
+    res.json({ ok: true, total: devices.length, updated, skipped });
+  } catch (error: any) {
+    res.status(400).json({
+      code: 'XIAOMI_LOCAL_TOKEN_SYNC_FAILED',
+      message: error?.message || '同步本地 Token 失败',
+    });
+  }
+};
 // ──────────────── Camera: capability probing (auto-detect & degrade) ────────────────
 export const getCameraCapabilities = async (
   req: Request,
@@ -1479,6 +1879,89 @@ export const getCameraCapabilities = async (
     const { did } = req.params;
     if (!did) {
       res.status(400).json({ code: 'DID_REQUIRED', message: '缺少设备 DID' });
+      return;
+    }
+    // 局域网 ONVIF/RTSP 摄像头：使用 ONVIF 能力（PTZ、事件侦测），不走米家云
+    const lanConfig = await lanCameraService.getLanCameraConfig(did).catch(() => null);
+    if (lanConfig) {
+      // 每次打开能力面板时现场探测一次 ONVIF，拿到最新的全部事件能力
+      // （厂商 App 里开关的变化/型号差异都能反映出来，而不是用添加设备时的旧结果）
+      let caps: any = lanConfig.capabilities ?? {};
+      let hasPTZ = !!lanConfig.hasPTZ;
+      try {
+        const fresh = await probeOnvifDevice({
+          ip: lanConfig.ip,
+          port: lanConfig.port,
+          username: lanConfig.username,
+          password: lanConfig.password,
+          timeoutMs: 6000,
+        });
+        if (fresh?.ok) {
+          caps = fresh.capabilities ?? caps;
+          hasPTZ = !!fresh.hasPTZ;
+        }
+      } catch {
+        /* 探测失败时沿用已保存能力 */
+      }
+      res.json({
+        did,
+        controlMode: 'onvif',
+        ptz: {
+          supported: hasPTZ,
+          controllable: hasPTZ,
+          calibrate: false,
+          directions: hasPTZ ? ['left', 'right', 'up', 'down'] : [],
+          zoom: hasPTZ,
+          hint: hasPTZ ? undefined : '该摄像头未识别到 ONVIF PTZ 服务',
+        },
+        nightVision: { supported: false, controllable: false, hint: '夜视设置请使用厂商 App/网页' },
+        audio: { supported: !!caps.audio, controllable: false, hint: caps.audio ? '录像含音频，开关请使用厂商 App' : undefined },
+        humanDetection: {
+          supported: !!caps.human,
+          controllable: false,
+          hint: caps.human ? '摄像头支持人形侦测事件（开关请在厂商 App 里设置）' : undefined,
+        },
+        motionDetection: {
+          supported: !!caps.motion,
+          controllable: false,
+          hint: caps.motion ? '摄像头支持移动侦测事件（开关请在厂商 App 里设置）' : undefined,
+        },
+        lineDetection: {
+          supported: !!caps.line,
+          controllable: false,
+          hint: caps.line ? '摄像头支持越界侦测事件（开关请在厂商 App 里设置）' : undefined,
+        },
+        intrusionDetection: {
+          supported: !!caps.intrusion,
+          controllable: false,
+          hint: caps.intrusion ? '摄像头支持区域入侵事件（开关请在厂商 App 里设置）' : undefined,
+        },
+        tamperDetection: {
+          supported: !!caps.tamper,
+          controllable: false,
+          hint: caps.tamper ? '摄像头支持视频遮挡报警（开关请在厂商 App 里设置）' : undefined,
+        },
+        objectLeftDetection: {
+          supported: !!caps.objectLeft,
+          controllable: false,
+          hint: caps.objectLeft ? '摄像头支持物品遗留检测（开关请在厂商 App 里设置）' : undefined,
+        },
+        objectRemovedDetection: {
+          supported: !!caps.objectRemoved,
+          controllable: false,
+          hint: caps.objectRemoved ? '摄像头支持物品拿取检测（开关请在厂商 App 里设置）' : undefined,
+        },
+        smartTracking: {
+          supported: !!caps.smartTracking,
+          controllable: false,
+          hint: caps.smartTracking ? '摄像头支持智能追踪（开关请在厂商 App 里设置）' : undefined,
+        },
+        faceRecognition: { supported: !!caps.face, controllable: false },
+        privacy: { supported: false, controllable: false },
+        recording: { supported: true, controllable: true },
+        snapshot: { supported: true, controllable: true },
+        fetchedAt: Date.now(),
+      });
       return;
     }
     const device = await systemService.prismaWrap(async (p) =>
@@ -1542,14 +2025,29 @@ export const startCameraRecording = async (
       res.status(400).json({ code: 'DID_REQUIRED', message: '缺少设备 DID' });
       return;
     }
-    const { mode, segmentMinutes } = (req.body ?? {}) as { mode?: 'motion' | 'continuous'; segmentMinutes?: number };
+    const { mode, segmentMinutes } = (req.body ?? {}) as { mode?: 'motion' | 'person' | 'continuous'; segmentMinutes?: number };
     const device = await systemService.prismaWrap(async (p) =>
       p.device.findUnique({ where: { did }, select: { model: true } }),
     );
     const xiaomiDevice = resolveXiaomiDeviceRef(device?.model ?? '', did);
-    // 录制源优先级：① 本地 go2rtc 桥 RTSP（若可用）→ ② 云端 HLS（稳定，ffmpeg 可稳定录制）
+    // 局域网摄像头：开始录像前先确保 go2rtc 桥/摄像头视频流已就绪，
+    // 否则刚接入/摄像头刚唤醒时 ffmpeg 无源会立即退出，表现为"点了录像又自动停止"。
+    const lanCameraConfig = await lanCameraService.getLanCameraConfig(did).catch(() => null);
+    if (lanCameraConfig) {
+      await lanCameraService.ensureLanCameraStream(did).catch(() => null);
+    }
+    // 局域网摄像头：直接使用其 RTSP 源录制，不经过小米云
+    const lanSourceUrl = await lanCameraService.resolveLanCameraRtsp(did).catch(() => null);
+    if (lanCameraConfig && !lanSourceUrl) {
+      res.status(409).json({
+        code: 'CAMERA_STREAM_NOT_READY',
+        message: '摄像头视频流尚未就绪（可能 WiFi 信号弱或刚唤醒），请先在监控墙打开一次画面或稍后重试',
+      });
+      return;
+    }
+    // 录制源优先级（米家摄像头）：① 本地 go2rtc 桥 RTSP（若可用）→ ② 云端 HLS（稳定，ffmpeg 可稳定录制）
     // → ③ 云端 RTSP（兜底，URL 时效短）
-    let sourceUrl = await systemService.resolveLocalGo2rtcRtsp(xiaomiDevice.did);
+    let sourceUrl = lanSourceUrl ?? (await systemService.resolveLocalGo2rtcRtsp(xiaomiDevice.did));
     if (!sourceUrl) {
       try {
         const hls = await xiaomiAdapter.startHLSStreamCached(xiaomiDevice.did, xiaomiDevice.scope);
@@ -1567,6 +2065,24 @@ export const startCameraRecording = async (
     if (mode === 'continuous') {
       const result = await systemService.startContinuousRecording(did, sourceUrl, { segmentMinutes });
       res.json({ did, ...result, mode: 'continuous' });
+      return;
+    }
+    if (mode === 'person') {
+      const lanConfig = await lanCameraService.getLanCameraConfig(did).catch(() => null);
+      if (!lanConfig || !lanConfig.ip) {
+        res.status(400).json({
+          code: 'PERSON_RECORDING_LAN_ONLY',
+          message: '人形事件触发录像只支持已保存的局域网摄像头（ONVIF）；请先在「添加设备/监控墙」里接入该摄像头',
+        });
+        return;
+      }
+      const result = await systemService.startPersonRecording(did, sourceUrl, {
+        ip: lanConfig.ip,
+        port: lanConfig.port,
+        username: lanConfig.username,
+        password: lanConfig.password,
+      });
+      res.json({ did, ...result, mode: 'person' });
       return;
     }
     const result = await systemService.startMotionRecording(did, sourceUrl);

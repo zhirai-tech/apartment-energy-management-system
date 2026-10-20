@@ -50,6 +50,10 @@ export class XiaomiCamera {
   // 摄像头设备列表缓存：前端每 ~15s 轮询一次（broadcastDashboard → refreshAllRoomsRealtime），
   // 每次都打多个区域端点既浪费又可能触发账号级限流；60s 内复用列表即可。
   private cameraDevicesCache: { at: number; devices: XiaomiDeviceInfo[] } | null = null;
+  // did → 设备实际所在云服务器区域。米家账号会话区域不一定等于设备区域
+  // （例如账号会话 region=cn，但德国区摄像头 C301 实际在 de 服务器上），
+  // 设备级接口（HLS/RTSP/PTZ/能力探测）必须用设备所在区域，否则会报 get udid 错误。
+  private deviceRegionCache = new Map<string, { region: string; at: number }>();
   private static CAMERA_DEVICES_TTL_MS = 60_000;
   private static CAP_TTL_MS = 60_000;
   // 云端 HLS 会话时效通常较短；TTL 太长会把已失效的 URL 复用给前端导致黑屏。
@@ -77,8 +81,34 @@ export class XiaomiCamera {
     // MiOT /app/miotspec/action 的 body 为 { params: { did, siid, aiid, in } }（单个对象），
     // 扁平 { did, siid, aiid, in } → code=-6，数组 { params: [...] } → code=-8
     const payload = { params: { did, siid, aiid, in: input } };
-    const result = await this.host.requestIo(session, 'POST', path, undefined, payload);
-    return result;
+    const baseRegion = (session.region || 'cn').toLowerCase();
+    const known = this.deviceRegionCache.get(did)?.region;
+    const candidates = Array.from(
+      new Set(
+        [
+          known,
+          baseRegion,
+          ...(baseRegion === 'cn' ? ['de', 'fr', 'at', 'i2', 'sg', 'us'] : ['cn', 'de', 'fr']),
+        ].filter((r): r is string => Boolean(r)),
+      ),
+    );
+    let lastErr: any = null;
+    for (const region of candidates) {
+      const sess = region === baseRegion ? session : { ...session, region };
+      try {
+        const result = await this.host.requestIo(sess, 'POST', path, undefined, payload);
+        this.deviceRegionCache.set(did, { region, at: Date.now() });
+        return result;
+      } catch (err: any) {
+        lastErr = err;
+        const msg = String(err?.message || err || '');
+        // 只有设备/区域类错误才换区域重试；其余错误（未登录、参数错误等）直接抛出
+        if (!/get udid|code=-8|code=-6|code=-704010|not exist|not found|invalid did/i.test(msg)) {
+          throw err;
+        }
+      }
+    }
+    throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
   }
 
   // ──────────────── Camera Spec mapping (MBC23 / C300 / C200 etc.) ────────────────
@@ -263,7 +293,7 @@ export class XiaomiCamera {
   // ──────────────── Camera region: fetch camera device list ────────────────
 
   public async fetchCameraDevices(): Promise<XiaomiDeviceInfo[]> {
-    // 60s 缓存：避免 broadcastDashboard（~15s 一次）每次都触发多区域探测
+    // 60s 缓存：避免 broadcastDashboard 每次都触发多区域探测
     if (
       this.cameraDevicesCache &&
       Date.now() - this.cameraDevicesCache.at < XiaomiCamera.CAMERA_DEVICES_TTL_MS
@@ -271,128 +301,83 @@ export class XiaomiCamera {
       return this.cameraDevicesCache.devices;
     }
     const session = await this.host.getSession('camera');
-    console.info('[XiaomiAdapter.fetchCameraDevices] 诊断入参：', {
-      hasSession: !!session,
-      region: session?.region ?? null,
-      userId: session?.userId ?? null,
-      mock: session?.serviceToken ? /^mock_/.test(session.serviceToken) : null,
-      apiBase: session ? buildApiBaseUrl(session.region) : null,
-    });
     if (!session || /^mock_/.test(session.serviceToken)) {
       return [];
     }
     const rooms = await prisma.room.findMany({ select: { id: true, roomNumber: true, name: true } });
     const listReal: XiaomiDeviceInfo[] = [];
-    const isIntlRegion = !!(session.region && session.region.toLowerCase() !== 'cn');
-    try {
-      const ioPathOptions = isIntlRegion
-        ? ['/home/device_list', '/app/home/device_list']
-        : [DEVICE_LIST_URL.replace(/^https:\/\/api\.io\.mi\.com/, '')];
-      const bodyVariants = isIntlRegion
-        ? [
-          { getVirtualModel: false, getHuamiDevices: 0, getSplitHumanDeviceInfos: 1 },
-          { getVirtualModel: true, getHuamiDevices: 1, getSplitHumanDeviceInfos: 1 },
-          { getVirtualModel: false, getHuamiDevices: 0 },
-        ]
-        : [
-          { getVirtualModel: false, getHuamiDevices: 0 },
-        ];
-      let list: RawDevice[] | null = null;
-      let finalPath: string | null = null;
-      let finalBody: any = null;
-      let finalRaw: any = null;
-      endpointLoop:
-      for (const ioPath of ioPathOptions) {
-        const fullUrl = `${buildApiBaseUrl(session.region)}${ioPath.startsWith('/') ? '' : '/'}${ioPath}`;
-        for (const body of bodyVariants) {
-          console.info('[XiaomiAdapter.fetchCameraDevices] EU 探测尝试：', {
-            region: session.region,
-            ioPath,
-            fullUrl,
-            body,
-          });
-          try {
-            const deviceResponse = (await this.host.requestIo(session, 'POST', ioPath, undefined, body)) as unknown;
-            const head = JSON.stringify(deviceResponse ?? {}).slice(0, 1500);
-            console.info('[XiaomiAdapter.fetchCameraDevices] EU 探测返回：', { ioPath, body, head });
-            const devicePayload = deviceResponse as {
-              list?: RawDevice[];
-              result?: { list?: RawDevice[]; device_list?: RawDevice[] };
-              device_list?: RawDevice[];
-            } | RawDevice[] | null;
-            const tryList: RawDevice[] | null = Array.isArray(devicePayload)
-              ? devicePayload
-              : Array.isArray(devicePayload?.list) && devicePayload.list.length > 0
-                ? devicePayload.list
-                : Array.isArray(devicePayload?.device_list) && devicePayload.device_list.length > 0
-                  ? devicePayload.device_list
-                  : Array.isArray(devicePayload?.result?.list) && devicePayload.result.list.length > 0
-                    ? devicePayload.result.list
-                    : Array.isArray(devicePayload?.result?.device_list) && devicePayload.result.device_list.length > 0
-                      ? devicePayload.result.device_list
-                      : Array.isArray(devicePayload?.list)
-                        ? devicePayload.list
-                        : Array.isArray(devicePayload?.result?.list)
-                          ? devicePayload.result.list
-                          : Array.isArray(devicePayload?.result?.device_list)
-                            ? devicePayload.result.device_list
-                            : Array.isArray(devicePayload?.device_list)
-                              ? devicePayload.device_list
-                              : null;
-            if (tryList && tryList.length > 0) {
-              list = tryList;
-              finalPath = ioPath;
-              finalBody = body;
-              finalRaw = deviceResponse;
-              break endpointLoop;
-            }
-            if (!list && tryList) {
-              list = tryList;
-              finalPath = ioPath;
-              finalBody = body;
-              finalRaw = deviceResponse;
-            }
-          } catch (probeErr: any) {
-            console.warn('[XiaomiAdapter.fetchCameraDevices] EU 探测失败：', {
-              ioPath, body, msg: probeErr?.message,
-            });
+    const baseRegion = (session.region || 'de').toLowerCase();
+    // 会话所在区域不一定等于设备所在服务器区域：
+    // 例如账号会话是 cn，但德国区摄像头（C301）在 de / fr 服务器上。
+    // 先在会话区域查询，查不到再依次探测国际区。
+    const regionCandidates = Array.from(
+      new Set([
+        baseRegion,
+        ...(baseRegion === 'cn'
+          ? ['de', 'fr', 'at', 'i2', 'sg', 'us']
+          : ['cn', 'de', 'fr']),
+      ]),
+    );
+    let list: RawDevice[] | null = null;
+    let foundRegion: string | null = null;
+    for (const probeRegion of regionCandidates) {
+      if (list && list.length > 0) break;
+      const probeSession = probeRegion === baseRegion ? session : { ...session, region: probeRegion };
+      for (const ioPath of ['/app/home/device_list', '/home/device_list']) {
+        try {
+          const deviceResponse = (await this.host.requestIo(probeSession, 'POST', ioPath, undefined, {
+            getVirtualModel: false,
+            getHuamiDevices: 0,
+          })) as any;
+          const candidates = [
+            deviceResponse,
+            deviceResponse?.list,
+            deviceResponse?.device_list,
+            deviceResponse?.result,
+            deviceResponse?.result?.list,
+            deviceResponse?.result?.device_list,
+          ];
+          const tryList: RawDevice[] | null =
+            candidates.find((candidate) => Array.isArray(candidate) && candidate.length > 0) ?? null;
+          if (tryList && tryList.length > 0) {
+            list = tryList;
+            foundRegion = probeRegion;
+            console.info(
+              '[XiaomiAdapter.fetchCameraDevices] 命中设备列表区域:',
+              probeRegion,
+              'path=',
+              ioPath,
+              'count=',
+              tryList.length,
+            );
+            break;
           }
+        } catch (probeErr: any) {
+          console.info(
+            '[XiaomiAdapter.fetchCameraDevices] 区域探测失败:',
+            probeRegion,
+            ioPath,
+            (probeErr?.message || '').slice(0, 120),
+          );
         }
       }
-      console.info('[XiaomiAdapter.fetchCameraDevices] EU 探测完成：', {
-        isIntlRegion,
-        finalPath,
-        finalBody,
-        finalLen: list?.length ?? null,
-        firstDevice: list && list.length > 0
-          ? { did: list[0].did, name: list[0].name, model: list[0].model, isOnline: (list[0] as any).isOnline ?? null }
-          : null,
-        finalRawKeys: finalRaw && typeof finalRaw === 'object' ? Object.keys(finalRaw as Record<string, any>) : null,
-        finalHead: finalRaw ? JSON.stringify(finalRaw).slice(0, 2400) : null,
-      });
-      if (Array.isArray(list) && list.length > 0) {
-        for (let i = 0; i < list.length; i++) {
-          const raw = list[i];
-          const roomId = this.host.resolveRoomId(rooms, raw);
-          listReal.push({
-            did: raw.did,
-            name: raw.name ?? raw.model ?? `camera_${i + 1}`,
-            model: raw.model ?? 'unknown',
-            online: raw.isOnline === true || raw.status === 1,
-            roomId,
-            localIp: raw.localip,
-            sourceRegion: session?.region || 'de',
-            sourceScope: 'camera',
-          });
-        }
+    }
+    if (Array.isArray(list) && list.length > 0) {
+      for (let i = 0; i < list.length; i++) {
+        const raw = list[i];
+        const roomId = this.host.resolveRoomId(rooms, raw);
+        listReal.push({
+          did: raw.did,
+          name: raw.name ?? raw.model ?? `camera_${i + 1}`,
+          model: raw.model ?? 'unknown',
+          online: raw.isOnline === true || raw.status === 1,
+          // 摄像头统一作为公共设施展示：不归属住户房间（避免被塞进房间卡片、没有直播预览）
+          roomId: null,
+          localIp: raw.localip,
+          sourceRegion: foundRegion || baseRegion,
+          sourceScope: 'camera',
+        });
       }
-    } catch (err: any) {
-      console.warn(
-        '[XiaomiAdapter] fetchCameraDevices 失败：',
-        err?.message,
-        '\n  stack=',
-        err?.stack ?? '',
-      );
     }
     const result = listReal.sort((a, b) => {
       const aCam = inferDeviceCategory({ name: a.name, model: a.model }) === DeviceCategory.CAMERA ? 0 : 1;
@@ -401,7 +386,23 @@ export class XiaomiCamera {
       return Number(b.online === true) - Number(a.online === true);
     });
     this.cameraDevicesCache = { at: Date.now(), devices: result };
+    // 记录每台设备实际所在区域，供设备级接口（HLS/RTSP/PTZ/能力探测）使用
+    for (const d of result) {
+      if (d.did && d.sourceRegion) {
+        this.deviceRegionCache.set(d.did, { region: String(d.sourceRegion).toLowerCase(), at: Date.now() });
+      }
+    }
     return result;
+  }
+
+  /** 按设备实际所在区域调整会话区域（会话区域≠设备区域时会自动切换） */
+  private sessionWithDeviceRegion(session: XiaomiSession, did: string): XiaomiSession {
+    const cached = this.deviceRegionCache.get(did)?.region;
+    const base = (session.region || '').toLowerCase();
+    if (cached && cached !== base) {
+      return { ...session, region: cached };
+    }
+    return session;
   }
 
   // ──────────────── Camera: capability probing (auto-detect & degrade) ────────────────
@@ -456,7 +457,8 @@ export class XiaomiCamera {
       const session = await this.host.getSession(scope);
       if (session && !/^mock_/.test(session.serviceToken)) {
         const payload = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((piid) => ({ did, siid: 2, piid }));
-        const resp = await this.host.requestIo(session, 'POST', '/app/miotspec/prop/get', {}, { params: payload });
+        const sess = this.sessionWithDeviceRegion(session, did);
+        const resp = await this.host.requestIo(sess, 'POST', '/app/miotspec/prop/get', {}, { params: payload });
         const items = Array.isArray(resp)
           ? resp
           : Array.isArray((resp as any)?.list)
@@ -517,6 +519,11 @@ export class XiaomiCamera {
     capability: string,
     value?: unknown,
   ): Promise<{ ok: boolean; state?: unknown; hint?: string }> {
+    // 米家云摄像头：云端仅开放"云台回中/校准"（方向控制走米家 App 的 P2P 通道，云端 API 不提供）
+    if (capability === 'ptzCalibrate' || capability === 'ptz-calibrate' || (capability === 'ptz' && String(value) === 'calibrate')) {
+      const ok = await this.calibrateCameraPTZ(did, scope);
+      return { ok: !!ok };
+    }
     const probe = await this.probeCameraCapabilities(did, model, scope);
     const entry = (probe as unknown as Record<string, CameraCapabilityState>)[capability];
     if (!entry || !entry.supported) {
@@ -538,7 +545,7 @@ export class XiaomiCamera {
     if (!session || /^mock_/.test(session.serviceToken)) {
       throw new AppError(400, 'XIAOMI_NOT_LOGGED_IN', '米家未登录，无法获取设备 token');
     }
-    const resp = await this.host.requestIo(session, 'POST', '/v1/miotspec/token', undefined, { params: { did } });
+    const resp = await this.host.requestIo(this.sessionWithDeviceRegion(session, did), 'POST', '/v1/miotspec/token', undefined, { params: { did } });
     let token = '';
     if (resp && typeof resp === 'object') {
       const r = resp as Record<string, any>;

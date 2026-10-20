@@ -889,3 +889,276 @@ export async function probeLanDeviceReachability(options: {
       .filter((port): port is number => typeof port === 'number'),
   };
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 局域网设备详情探测：端口 + HTTP 标题 + MiIO 本地协议 + 设备类型推断
+// 用于"添加设备"向导：扫描到设备后，告诉用户这是什么设备、支持什么接入方式。
+// ─────────────────────────────────────────────────────────────────────────────
+
+const DEVICE_PROBE_TCP_PORTS: number[] = [
+  80, 443, 22, 23, 21, 554, 8554, 2020, 8000, 8080, 8081, 8443, 8899,
+  37777, 502, 6668, 1883, 8883, 9100, 54321, 9000, 3000, 5000, 5357, 8086,
+];
+
+export type LanDeviceRoleHint =
+  | 'camera'
+  | 'router'
+  | 'breaker'
+  | 'printer'
+  | 'nas'
+  | 'iot'
+  | 'computer'
+  | 'unknown';
+
+export interface LanDeviceProbeDetail {
+  ip: string;
+  mac: string | null;
+  vendor: string | null;
+  name: string | null;
+  hostname: string | null;
+  pingAlive: boolean;
+  openTcpPorts: number[];
+  httpTitle: string | null;
+  httpDescription: string | null;
+  httpServer: string | null;
+  miioSupported: boolean;
+  miioDeviceId: number | null;
+  roleHint: LanDeviceRoleHint;
+  roleLabel: string;
+  suggestedCategory: 'camera' | 'circuit_breaker' | 'wifi_ap' | 'smart_appliance' | 'other';
+  suggestedProvider: 'xiaomi-local' | 'onvif' | 'http-modbus' | 'cloud' | 'unknown';
+}
+
+async function fetchHttpBanner(
+  ip: string,
+  port: number,
+  timeoutMs = 2500,
+): Promise<{ title: string | null; description: string | null; server: string | null } | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const url = `http://${ip}${port === 80 ? '' : `:${port}`}/`;
+    const res = await fetch(url, {
+      signal: controller.signal,
+      redirect: 'follow',
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ZHIRAI-Probe/1.0)' },
+    });
+    const server = res.headers.get('server');
+    const ct = res.headers.get('content-type') ?? '';
+    let title: string | null = null;
+    let description: string | null = null;
+    if (/text\/html|application\/xhtml/i.test(ct)) {
+      const text = (await res.text()).slice(0, 30000);
+      title = text.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.replace(/\s+/g, ' ').trim().slice(0, 80) || null;
+      description = text.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)["']/i)?.[1]?.replace(/\s+/g, ' ').trim().slice(0, 120) || null;
+    }
+    return { title: title || null, description: description || null, server: server || null };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** MiIO 本地协议探测（UDP 54321 标准 hello 包），不读取/修改任何设备状态 */
+export function probeMiioDevice(ip: string, timeoutMs = 1500): Promise<{ supported: boolean; deviceId: number | null }> {
+  return new Promise((resolve) => {
+    const sock = dgram.createSocket('udp4');
+    let settled = false;
+    const finish = (result: { supported: boolean; deviceId: number | null }) => {
+      if (settled) return;
+      settled = true;
+      try {
+        sock.close();
+      } catch {
+        /* noop */
+      }
+      resolve(result);
+    };
+    const timer = setTimeout(() => finish({ supported: false, deviceId: null }), timeoutMs);
+    sock.on('error', () => {
+      clearTimeout(timer);
+      finish({ supported: false, deviceId: null });
+    });
+    sock.on('message', (msg) => {
+      clearTimeout(timer);
+      if (msg.length >= 32) {
+        finish({ supported: true, deviceId: msg.readUInt32BE(8) });
+      } else {
+        finish({ supported: true, deviceId: null });
+      }
+    });
+    const pkt = Buffer.alloc(32);
+    pkt[0] = 0x21;
+    pkt[1] = 0x31;
+    pkt[2] = 0x00;
+    pkt[3] = 0x20;
+    for (let i = 4; i < 32; i += 1) pkt[i] = 0xff;
+    sock.send(pkt, 0, pkt.length, 54321, ip, (err) => {
+      if (err) {
+        clearTimeout(timer);
+        finish({ supported: false, deviceId: null });
+      }
+    });
+  });
+}
+
+const CAMERA_PORTS = new Set([554, 8554, 2020, 37777, 37778, 34567, 8000]);
+const ROUTER_KEYWORDS = /router|路由|gateway|网关|emui|openwrt|tp-?link|asus|netgear|nokia|beacon|huawei|mercury|mesh|wifi|无线/;
+const CAMERA_KEYWORDS = /camera|cam\b|ipc|dvr|nvr|监控|摄像|onvif|rtsp|ezviz|萤石|tapo|vigi/;
+const PRINTER_KEYWORDS = /printer|打印|hp\b|canon|epson|brother|激光/;
+const NAS_KEYWORDS = /nas\b|synology|群晖|qnap|威联通|truenas|webdav|samba/;
+
+function inferRoleDetail(input: {
+  openTcpPorts: number[];
+  httpTitle: string | null;
+  httpDescription: string | null;
+  httpServer: string | null;
+  vendor: string | null;
+  name: string | null;
+  hostname: string | null;
+  miioSupported: boolean;
+}): Pick<LanDeviceProbeDetail, 'roleHint' | 'roleLabel' | 'suggestedCategory' | 'suggestedProvider'> {
+  const haystack = [input.httpTitle, input.httpDescription, input.httpServer, input.vendor, input.name, input.hostname]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  const ports = new Set(input.openTcpPorts);
+  const hasCameraPort = input.openTcpPorts.some((port) => CAMERA_PORTS.has(port));
+
+  if (input.miioSupported) {
+    const isBreaker = /breaker|switch|通断|空开|插座|relay|计量/.test(haystack) || /xiaomi|mi\b|redmi/.test(haystack);
+    return {
+      roleHint: isBreaker ? 'breaker' : 'iot',
+      roleLabel: isBreaker ? '小米智能空开/开关（支持本地控制）' : '小米智能设备（支持本地接入）',
+      suggestedCategory: isBreaker ? 'circuit_breaker' : 'smart_appliance',
+      suggestedProvider: 'xiaomi-local',
+    };
+  }
+  if (hasCameraPort || CAMERA_KEYWORDS.test(haystack)) {
+    return {
+      roleHint: 'camera',
+      roleLabel: '网络摄像头（ONVIF / RTSP）',
+      suggestedCategory: 'camera',
+      suggestedProvider: 'onvif',
+    };
+  }
+  if (PRINTER_KEYWORDS.test(haystack) || ports.has(9100)) {
+    return { roleHint: 'printer', roleLabel: '网络打印机', suggestedCategory: 'other', suggestedProvider: 'unknown' };
+  }
+  if (NAS_KEYWORDS.test(haystack)) {
+    return { roleHint: 'nas', roleLabel: 'NAS 网络存储', suggestedCategory: 'other', suggestedProvider: 'unknown' };
+  }
+  if (ROUTER_KEYWORDS.test(haystack) || (ports.has(80) && ports.has(443) && ports.size >= 3)) {
+    return {
+      roleHint: 'router',
+      roleLabel: '路由器 / WiFi 网关',
+      suggestedCategory: 'wifi_ap',
+      suggestedProvider: 'cloud',
+    };
+  }
+  if (ports.has(22) && (ports.has(80) || ports.has(443))) {
+    return {
+      roleHint: 'computer',
+      roleLabel: '电脑 / 小型服务器',
+      suggestedCategory: 'other',
+      suggestedProvider: 'unknown',
+    };
+  }
+  if (ports.has(6668) || ports.has(1883) || ports.has(8883)) {
+    return { roleHint: 'iot', roleLabel: '智能 IoT 设备', suggestedCategory: 'smart_appliance', suggestedProvider: 'unknown' };
+  }
+  return { roleHint: 'unknown', roleLabel: '未知设备', suggestedCategory: 'other', suggestedProvider: 'unknown' };
+}
+
+/**
+ * 批量探测局域网设备详情（端口 / 标题 / MiIO / 类型推断）。
+ * 只做只读探测：TCP 连接、HTTP GET、MiIO hello，不发送任何控制命令。
+ */
+export async function probeLanDevicesDetailed(
+  items: Array<{ ip: string; mac?: string | null; vendor?: string | null; name?: string | null; hostname?: string | null }>,
+): Promise<LanDeviceProbeDetail[]> {
+  const results: LanDeviceProbeDetail[] = [];
+  const queue = [...items];
+
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const item = queue.shift();
+      if (!item) return;
+      const ip = String(item.ip ?? '').trim();
+      if (!ip) continue;
+      try {
+        const reach = await probeLanDeviceReachability({
+          ip,
+          pingTimeoutMs: 600,
+          tcpTimeoutMs: 500,
+          tcpPorts: DEVICE_PROBE_TCP_PORTS,
+        });
+        const order = [80, 443, 8000, 8080, 8443, 2020, 8899];
+        const httpPort = order.find((port) => reach.openTcpPorts.includes(port)) ?? null;
+        let banner = httpPort ? await fetchHttpBanner(ip, httpPort) : null;
+        if (httpPort && (!banner || !banner.title)) {
+          banner = (await fetchHttpBanner(ip, httpPort, 4500)) ?? banner;
+        }
+        let miio = await probeMiioDevice(ip, 1500);
+        if (!miio.supported) {
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          miio = await probeMiioDevice(ip, 1500);
+        }
+        const role = inferRoleDetail({
+          openTcpPorts: reach.openTcpPorts,
+          httpTitle: banner?.title ?? null,
+          httpDescription: banner?.description ?? null,
+          httpServer: banner?.server ?? null,
+          vendor: item.vendor ?? null,
+          name: item.name ?? null,
+          hostname: item.hostname ?? null,
+          miioSupported: miio.supported,
+        });
+        results.push({
+          ip,
+          mac: item.mac ?? null,
+          vendor: item.vendor ?? null,
+          name: item.name ?? null,
+          hostname: item.hostname ?? null,
+          pingAlive: reach.pingAlive,
+          openTcpPorts: reach.openTcpPorts,
+          httpTitle: banner?.title ?? null,
+          httpDescription: banner?.description ?? null,
+          httpServer: banner?.server ?? null,
+          miioSupported: miio.supported,
+          miioDeviceId: miio.deviceId,
+          ...role,
+        });
+      } catch {
+        results.push({
+          ip,
+          mac: item.mac ?? null,
+          vendor: item.vendor ?? null,
+          name: item.name ?? null,
+          hostname: item.hostname ?? null,
+          pingAlive: false,
+          openTcpPorts: [],
+          httpTitle: null,
+          httpDescription: null,
+          httpServer: null,
+          miioSupported: false,
+          miioDeviceId: null,
+          roleHint: 'unknown',
+          roleLabel: '探测失败',
+          suggestedCategory: 'other',
+          suggestedProvider: 'unknown',
+        });
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(Math.max(1, items.length), 6) }, () => worker()));
+  return results.sort((a, b) => {
+    const order = (role: LanDeviceRoleHint): number =>
+      role === 'breaker' ? 0 : role === 'camera' ? 1 : role === 'router' ? 2 : role === 'iot' ? 3 : 4;
+    const diff = order(a.roleHint) - order(b.roleHint);
+    if (diff !== 0) return diff;
+    return a.ip.localeCompare(b.ip, 'en', { numeric: true });
+  });
+}

@@ -235,6 +235,14 @@ class XiaomiAdapter {
   private realtimeRefreshPromise: Promise<void> | null = null;
   private dailyHistorySyncPromise: Promise<void> | null = null;
   private lastDailyHistorySyncAt = 0;
+  /** camera 区会话 401 自动恢复：single-flight（并发 401 共享同一个 Promise，绝不并发登录） */
+  private cameraAuthRecoveryPromise: Promise<boolean> | null = null;
+  /** camera 区会话自动登录恢复的最后一次尝试时间（用于限频，防触发小米风控） */
+  private cameraAuthRecoveryAt = 0;
+  /** camera 区会话最近一次成功写入 Redis 的时间戳（代理据此清除冷却/失败计数） */
+  private cameraSessionUpdatedAt = 0;
+  /** 自动登录恢复的最小间隔：5 分钟内最多尝试 1 次 */
+  private static CAMERA_AUTH_RECOVERY_INTERVAL_MS = 5 * 60 * 1000;
 
   private constructor() {}
 
@@ -255,6 +263,8 @@ class XiaomiAdapter {
 
   private async setSession(session: XiaomiSession, scope: XiaomiSessionScope = 'main') {
     await writeSessionToRedis(session, scope);
+    // camera 区会话刷新时间戳：CloudHlsProxy 据此在自动重登成功后清除冷却/失败计数
+    if (scope === 'camera') this.cameraSessionUpdatedAt = Date.now();
   }
 
   private async setPendingLogin(context: XiaomiPendingLoginContext, scope: XiaomiSessionScope = 'main') {
@@ -280,6 +290,108 @@ class XiaomiAdapter {
   public async isLoggedIn(scope: XiaomiSessionScope = 'main'): Promise<boolean> {
     const session = await this.getSession(scope);
     return !!(session && !/^mock_/.test(session.serviceToken));
+  }
+
+  /** camera 区会话最近一次成功写入 Redis 的时间戳（供 CloudHlsProxy 清除冷却/失败计数） */
+  public getCameraSessionUpdatedAt(): number {
+    return this.cameraSessionUpdatedAt;
+  }
+
+  /**
+   * camera 区会话失效（401）时的受控自动恢复：
+   * - single-flight：并发 401 共享同一个 Promise，绝不并发触发登录
+   * - 限频：5 分钟内最多自动尝试 1 次，避免触发小米风控
+   * - 仅当 XIAOMI_CAMERA_USERNAME / XIAOMI_CAMERA_PASSWORD 存在时才调用现有 login()
+   * - 登录触发验证（notificationUrl / email_code / challenge）→ 立即停止并置 challenge_required
+   * - 成功 → login() 已写 Redis 并置 logged_in；调用方可携带新会话重试原请求
+   */
+  public async recoverCameraSession(scope: XiaomiSessionScope = 'camera'): Promise<boolean> {
+    if (scope !== 'camera') return false;
+    if (this.cameraAuthRecoveryPromise) return this.cameraAuthRecoveryPromise;
+    this.cameraAuthRecoveryPromise = this.recoverCameraSessionInner().finally(() => {
+      this.cameraAuthRecoveryPromise = null;
+    });
+    return this.cameraAuthRecoveryPromise;
+  }
+
+  private async recoverCameraSessionInner(): Promise<boolean> {
+    const now = Date.now();
+    if (now - this.cameraAuthRecoveryAt < XiaomiAdapter.CAMERA_AUTH_RECOVERY_INTERVAL_MS) {
+      console.warn('[XiaomiAdapter] camera auth recovery skipped (rate limited, 5min window)');
+      return false;
+    }
+    this.cameraAuthRecoveryAt = now;
+    const env = getCameraEnvCredentials();
+    if (!env.username || !env.password) {
+      console.warn('[XiaomiAdapter] camera auth recovery skipped (no env credentials)');
+      await this.setAuthStatus({
+        state: 'error',
+        needsVerification: false,
+        verificationMethod: null,
+        message: '摄像头登录已失效，请重新登录',
+        username: undefined,
+        lastAttemptAt: new Date().toISOString(),
+      }, 'camera');
+      return false;
+    }
+    console.warn('[XiaomiAdapter] camera session invalid, attempting ONE controlled auto re-login');
+    await this.setAuthStatus({
+      state: 'recovering',
+      needsVerification: false,
+      verificationMethod: null,
+      message: '摄像头会话已失效，正在自动恢复',
+      username: env.username,
+      lastAttemptAt: new Date().toISOString(),
+    }, 'camera');
+    try {
+      // 只尝试一次；复用现有 login()，不做任何循环/重试，不绕过验证
+      await this.login(env.username, env.password, 'camera', undefined);
+      const fresh = await this.getSession('camera');
+      if (!fresh || /^mock_/.test(fresh.serviceToken)) {
+        await this.setAuthStatus({
+          state: 'error',
+          needsVerification: false,
+          verificationMethod: null,
+          message: '摄像头会话恢复失败，请重新登录',
+          username: env.username,
+          lastAttemptAt: new Date().toISOString(),
+        }, 'camera');
+        return false;
+      }
+      console.warn('[XiaomiAdapter] camera auth auto-recovery succeeded');
+      return true;
+    } catch (err: any) {
+      const status = await this.getAuthStatus('camera').catch(() => null);
+      const msg = String(err?.message || '');
+      // 识别小米验证流程：notificationUrl / email_code / challenge / 二次验证 → 停止自动登录
+      const needsVerification =
+        status?.state === 'challenge_required' ||
+        !!status?.notificationUrl ||
+        /安全验证|两步验证|验证码|challenge|notificationUrl/i.test(msg);
+      if (needsVerification) {
+        console.warn('[XiaomiAdapter] camera auth auto-recovery needs manual verification, stopping');
+        await this.setAuthStatus({
+          state: 'challenge_required',
+          needsVerification: true,
+          verificationMethod: status?.verificationMethod ?? 'email_code',
+          message: '摄像头登录需要验证，请完成小米账号验证',
+          notificationUrl: status?.notificationUrl,
+          username: status?.username ?? env.username,
+          lastAttemptAt: new Date().toISOString(),
+        }, 'camera');
+        return false;
+      }
+      console.warn('[XiaomiAdapter] camera auth auto-recovery failed:', msg);
+      await this.setAuthStatus({
+        state: 'error',
+        needsVerification: false,
+        verificationMethod: status?.verificationMethod ?? null,
+        message: '摄像头登录失败，请重新登录',
+        username: status?.username ?? env.username,
+        lastAttemptAt: new Date().toISOString(),
+      }, 'camera');
+      return false;
+    }
   }
 
   public async login(
@@ -1402,7 +1514,13 @@ class XiaomiAdapter {
     };
   }
 
-  private async requestIo(session: XiaomiSession, method: 'GET' | 'POST', path: string, params?: Record<string, any>, body?: any) {
+  private async requestIo(
+    session: XiaomiSession,
+    method: 'GET' | 'POST',
+    path: string,
+    params?: Record<string, any>,
+    body?: any,
+  ): Promise<any> {
     const regionLower = (session.region || REGION_DEFAULT).toLowerCase();
     const isIntl = regionLower !== 'cn';
     const intlHostCandidates = isIntl
@@ -1434,6 +1552,15 @@ class XiaomiAdapter {
       return 'GMT+01:00';
     };
     let lastError: any = null;
+    // 判断当前会话是否为 camera 区会话（只有 camera 区进入 401 自动恢复；main 区行为保持原样）
+    let isCameraSession = false;
+    try {
+      const cam = await readSessionFromRedis('camera');
+      isCameraSession =
+        !!cam && !!session && session.serviceToken === cam.serviceToken && !/^mock_/.test(session.serviceToken);
+    } catch {
+      isCameraSession = false;
+    }
     for (const r of intlHostCandidates) {
       try {
         const rr = r.toLowerCase();
@@ -1481,6 +1608,17 @@ class XiaomiAdapter {
             typeof data === 'object' && data
               ? data?.message || data?.desc || JSON.stringify(data).slice(0, 300)
               : String(data ?? '');
+          // camera 区 401：会话很可能已失效 → 单飞受控自动恢复，成功后携带新会话重试一次
+          if (resp.status === 401 && isCameraSession) {
+            const recovered = await this.recoverCameraSession();
+            if (recovered) {
+              const fresh = await this.getSession('camera');
+              if (fresh && fresh.serviceToken !== session.serviceToken) {
+                console.warn('[XiaomiAdapter] requestIo 401 recovered, retrying with fresh camera session');
+                return this.requestIo(fresh, method, path, params, body);
+              }
+            }
+          }
           lastError = new Error(`[XiaomiAdapter] requestIo region=${rr} HTTP ${resp.status}: ${String(message).slice(0, 400)}`);
           continue;
         }
@@ -2297,6 +2435,37 @@ class XiaomiAdapter {
     this.lastDailyHistorySyncAt = Date.now();
   }
 
+  /**
+   * 拉取主账号下所有设备的本地 token（仅用于局域网直连，不返回给前端）。
+   * 需要先在系统设置里完成米家云登录。
+   */
+  public async fetchDeviceTokens(): Promise<
+    Array<{ did: string; name: string; model: string; ip: string | null; token: string; online: boolean }>
+  > {
+    const session = await this.peekSession('main');
+    if (!session || !session.serviceToken || /^mock_/.test(session.serviceToken)) {
+      throw new Error('米家云未登录（请先在系统设置完成米家账号登录）');
+    }
+    const raw = await this.requestIo(session, 'POST', '/app/home/device_list', undefined, {
+      getVirtualModel: false,
+      getHuamiDevices: 0,
+    });
+    const list: any[] = Array.isArray(raw?.list)
+      ? raw.list
+      : Array.isArray(raw?.result?.list)
+        ? raw.result.list
+        : [];
+    return list
+      .filter((item) => item && item.token && String(item.token).length === 32)
+      .map((item) => ({
+        did: String(item.did),
+        name: String(item.name ?? item.model ?? item.did),
+        model: String(item.model ?? ''),
+        ip: item.localip ? String(item.localip) : null,
+        token: String(item.token),
+        online: item.isOnline !== false,
+      }));
+  }
   public async ensureDailyHistoryFresh(days: number = 35, maxAgeMs: number = 60 * 1000): Promise<void> {
     if (this.lastDailyHistorySyncAt && Date.now() - this.lastDailyHistorySyncAt <= maxAgeMs) {
       return;

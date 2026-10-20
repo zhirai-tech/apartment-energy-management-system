@@ -1,7 +1,19 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { LayoutDashboard, BarChart3, Power, RefreshCw, ShieldAlert, BellRing, ZapOff, X, Plus, PencilLine, Search } from 'lucide-react';
+import {
+  LayoutDashboard,
+  BarChart3,
+  Power,
+  RefreshCw,
+  ShieldAlert,
+  BellRing,
+  ZapOff,
+  X,
+  Plus,
+  PencilLine,
+  Search,
+} from 'lucide-react';
 import { toast } from 'sonner';
 import * as api from '@/lib/api';
 import { getSocket } from '@/lib/socket';
@@ -20,6 +32,7 @@ import {
 } from '@/types';
 import type { DashboardSummary, AlarmLogResponse, SiteSummary } from '@/types';
 import { StatsCards } from '@/components/dashboard/StatsCards';
+import { RemoteAccessBanner } from '@/components/dashboard/RemoteAccessBanner';
 import { RoomsGrid, type DashboardSpaceCard, floorToDualLabel } from '@/components/dashboard/RoomsGrid';
 import { Separator } from '@/components/ui/separator';
 import { Button } from '@/components/ui/button';
@@ -253,6 +266,7 @@ export function DashboardPage() {
     refetchIntervalInBackground: true,
     staleTime: dashboardRefreshInterval,
   });
+
   const { data: unresolvedAlarms } = useQuery<{
     items: AlarmLogResponse[];
     total: number;
@@ -826,17 +840,22 @@ export function DashboardPage() {
     const keys = ['circuit_breaker', 'camera', 'wifi_ap', 'five_g_cpe', 'smart_appliance', 'other'];
     return keys.filter((k) => (allCategoryCounts[k] ?? 0) > 0);
   }, [allCategoryCounts]);
+  // 分类页签：分类多于一个时，最前面加一个「全部」（默认仍显示智能空开）
+  const globalCategoryTabs = useMemo<string[]>(
+    () => (presentGlobalCategories.length > 1 ? ['all', ...presentGlobalCategories] : presentGlobalCategories),
+    [presentGlobalCategories],
+  );
   const [activeGlobalCategory, setActiveGlobalCategory] = useState<string>('circuit_breaker');
   const [activeFloorFilter, setActiveFloorFilter] = useState<string>('all');
   useEffect(() => {
     if (!presentGlobalCategories.length) return;
-    if (presentGlobalCategories.includes(activeGlobalCategory)) return;
+    if (globalCategoryTabs.includes(activeGlobalCategory)) return;
     if (presentGlobalCategories.includes('circuit_breaker')) {
       setActiveGlobalCategory('circuit_breaker');
       return;
     }
     setActiveGlobalCategory(presentGlobalCategories[0]);
-  }, [presentGlobalCategories, activeGlobalCategory]);
+  }, [globalCategoryTabs, activeGlobalCategory]);
 
   // 录像回放页深链：?camera=<did> 时切换到摄像头分类，确保摄像头卡片渲染并自动打开详情
   useEffect(() => {
@@ -866,7 +885,7 @@ export function DashboardPage() {
 
   const filteredCards = useMemo<DashboardSpaceCard[]>(() => {
     let arr = displayCards;
-    if (activeGlobalCategory) {
+    if (activeGlobalCategory && activeGlobalCategory !== 'all') {
       arr = arr.filter((card) =>
         (card.devices ?? []).some((d) => String((d as any).category ?? 'other') === activeGlobalCategory),
       );
@@ -886,7 +905,9 @@ export function DashboardPage() {
   const isEmptySelectedSite = !!selectedSite && (selectedSite.deviceCount === 0 || displayCards.length === 0);
   const pricePerKwh = settings?.pricePerKwh ?? 0.6;
   const activeCategoryLabel =
-    (DEVICE_CATEGORY_LABEL as Record<string, string>)[activeGlobalCategory] ?? activeGlobalCategory ?? '设备';
+    activeGlobalCategory === 'all'
+      ? '全部设备'
+      : (DEVICE_CATEGORY_LABEL as Record<string, string>)[activeGlobalCategory] ?? activeGlobalCategory ?? '设备';
   const allDevicesPoweredOn = useMemo(() => {
     const rooms = Array.isArray(summary?.roomData)
       ? summary.roomData.filter((room) => room.devices.length > 0)
@@ -1163,6 +1184,8 @@ export function DashboardPage() {
         ) : null}
       </div>
 
+      <RemoteAccessBanner />
+
       {isLoading ? (
         <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-6">
           {Array.from({ length: 6 }).map((_, i) => (
@@ -1187,12 +1210,12 @@ export function DashboardPage() {
             </span>
           </div>
           <div className="flex flex-wrap items-stretch gap-2">
-            {presentGlobalCategories.length > 0 ? (
+            {globalCategoryTabs.length > 0 ? (
               <Tabs value={activeGlobalCategory} onValueChange={setActiveGlobalCategory} className="w-auto shrink-0">
                 <TabsList className="inline-flex flex-wrap h-9 rounded-lg bg-muted/60 p-1 gap-1">
-                  {presentGlobalCategories.map((cat) => {
-                    const label = ((DEVICE_CATEGORY_LABEL as Record<string, string>)[cat] ?? cat);
-                    const count = allCategoryCounts[cat] ?? 0;
+                  {globalCategoryTabs.map((cat) => {
+                    const label = cat === 'all' ? '全部' : ((DEVICE_CATEGORY_LABEL as Record<string, string>)[cat] ?? cat);
+                    const count = cat === 'all' ? displayCards.length : (allCategoryCounts[cat] ?? 0);
                     return (
                       <TabsTrigger
                         key={cat}

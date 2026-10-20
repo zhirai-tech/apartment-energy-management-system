@@ -202,6 +202,194 @@ export const energy = {
       .then((res) => res.data),
 };
 
+export interface CameraFeatureCapabilities {
+  ptz: boolean;
+  events: boolean;
+  motion: boolean;
+  human: boolean;
+  face: boolean;
+  line: boolean;
+  intrusion: boolean;
+  tamper: boolean;
+  audio: boolean;
+  analytics: boolean;
+  recording: boolean;
+}
+
+export interface CameraListItem {
+  did: string;
+  name: string;
+  online: boolean;
+  source: 'lan' | 'xiaomi';
+  brand: string | null;
+  model: string | null;
+  localIp: string | null;
+  roomId: string | null;
+  roomNumber: string | null;
+  roomName: string | null;
+  hasPTZ: boolean;
+  hasLocalStream: boolean;
+  capabilities?: CameraFeatureCapabilities;
+}
+
+export interface CameraListResponse {
+  loggedIn: boolean;
+  username: string | null;
+  region: string | null;
+  auth?: {
+    state?: string | null;
+    needsVerification?: boolean | null;
+    verificationMethod?: 'email_code' | 'browser' | null;
+    message?: string | null;
+  } | null;
+  cameras: CameraListItem[];
+}
+
+export interface OnvifDiscoveredCamera {
+  ip: string;
+  xaddr?: string | null;
+  scopes?: string | null;
+  name?: string | null;
+  hardware?: string | null;
+}
+
+export interface LanCameraProbeResult {
+  ok: boolean;
+  mode: 'onvif' | 'rtsp';
+  ip: string;
+  port: number;
+  brand: string | null;
+  model: string | null;
+  manufacturer: string | null;
+  hasPTZ: boolean;
+  profiles: Array<{
+    token: string;
+    name: string;
+    encoding: string | null;
+    width: number | null;
+    height: number | null;
+    rtspUrl: string | null;
+    snapshotUrl: string | null;
+  }>;
+  rtspUrl: string | null;
+  subRtspUrl: string | null;
+  snapshotUrl: string | null;
+  rtspTest: { ok: boolean; url: string; errorMessage?: string; videoInfo?: string | null } | null;
+  subRtspTest?: { ok: boolean; url: string; errorMessage?: string; videoInfo?: string | null } | null;
+  capabilities: CameraFeatureCapabilities;
+  errorMessage?: string;
+  warnings: string[];
+}
+
+export interface LanCameraSavePayload {
+  name?: string;
+  ip: string;
+  port?: number;
+  username?: string;
+  password?: string;
+  brand?: string | null;
+  model?: string | null;
+  source?: 'onvif' | 'rtsp';
+  rtspUrl: string;
+  subRtspUrl?: string | null;
+  snapshotUrl?: string | null;
+  hasPTZ?: boolean;
+  transcodeH264?: boolean;
+  preferSubStream?: boolean;
+  capabilities?: Partial<CameraFeatureCapabilities> | null;
+  roomId?: string | null;
+}
+
+export interface LanCameraSaveResult {
+  did: string;
+  name: string;
+  isNew: boolean;
+  camera: CameraListItem;
+}
+
+export interface LanProbeDeviceDetail {
+  ip: string;
+  mac: string | null;
+  vendor: string | null;
+  name: string | null;
+  hostname: string | null;
+  pingAlive: boolean;
+  openTcpPorts: number[];
+  httpTitle: string | null;
+  httpDescription: string | null;
+  httpServer: string | null;
+  miioSupported: boolean;
+  miioDeviceId: number | null;
+  roleHint: 'camera' | 'router' | 'breaker' | 'printer' | 'nas' | 'iot' | 'computer' | 'unknown';
+  roleLabel: string;
+  suggestedCategory: 'camera' | 'circuit_breaker' | 'wifi_ap' | 'smart_appliance' | 'other';
+  suggestedProvider: 'xiaomi-local' | 'onvif' | 'http-modbus' | 'cloud' | 'unknown';
+}
+
+export interface LanScanHistoryDevice {
+  ip: string;
+  mac?: string | null;
+  vendor?: string | null;
+  name?: string | null;
+  hostname?: string | null;
+  pingAlive?: boolean;
+  fromArp?: boolean;
+}
+
+export interface LanScanHistoryItem {
+  id: string;
+  scannedAt: string;
+  subnet: string;
+  deviceCount: number;
+  aliveCount: number;
+  arpCount: number;
+  devices: LanScanHistoryDevice[];
+}
+
+/** 摄像头厂商侧功能开关（移动侦测 / 人形侦测 / 录音 / 事件录像） */
+export interface CameraFeatureState {
+  did?: string;
+  supported: boolean;
+  vendor: 'mercury' | 'unknown' | string;
+  motionDetected?: boolean;
+  humanDetected?: boolean;
+  sensitivity?: 'low' | 'medium' | 'high' | string;
+  humanSensitivity?: string;
+  localRecording?: boolean;
+  storageOnline?: boolean;
+  motionLinkRecording?: boolean;
+  audioEnabled?: boolean;
+  audioMuted?: boolean;
+  noiseCancelling?: boolean;
+  message?: string;
+}
+
+export interface LanCameraDetections {
+  did: string;
+  supported: boolean;
+  message?: string;
+  human?: { supported: boolean; enabled: boolean; sensitivity?: number };
+  intrusion?: { supported: boolean; enabled: boolean };
+}
+
+export interface CameraFeaturePatch {
+  motionDetected?: boolean;
+  humanDetected?: boolean;
+  sensitivity?: 'low' | 'medium' | 'high';
+  localRecording?: boolean;
+  motionLinkRecording?: boolean;
+  audioEnabled?: boolean;
+}
+
+export interface RemoteAccessInfo {
+  enabled: boolean;
+  url: string | null;
+  provider: string;
+  checkedAt: string;
+  hint?: string;
+  ok?: boolean;
+}
+
 export const system = {
   getSites: (): Promise<SiteSummary[]> =>
     api.get('/system/sites').then((res) => res.data),
@@ -211,6 +399,10 @@ export const system = {
     api.put(`/system/sites/${siteId}`, data).then((res) => res.data),
   getSettings: (): Promise<SystemSettingsData> =>
     api.get('/system/settings').then((res) => res.data),
+  getRemoteAccessInfo: (): Promise<RemoteAccessInfo> =>
+    api.get('/system/remote-access').then((res) => res.data),
+  renewRemoteAccess: (): Promise<RemoteAccessInfo> =>
+    api.post('/system/remote-access/renew').then((res) => res.data),
   updateSettings: (partial: Partial<SystemSettingsData>): Promise<any> =>
     api.put('/system/settings', partial).then((res) => res.data),
   refreshReferencePrice: (data?: {
@@ -229,7 +421,7 @@ export const system = {
     hasEnvCredentials: boolean;
     username?: string;
     auth?: {
-      state: 'idle' | 'logged_in' | 'challenge_required' | 'error';
+      state: 'idle' | 'logged_in' | 'challenge_required' | 'error' | 'recovering';
       needsVerification: boolean;
       verificationMethod?: 'browser' | 'email_code' | null;
       message?: string;
@@ -317,6 +509,12 @@ export const system = {
     api.post('/system/xiaomi/login', { verificationCode }).then((res) => res.data),
   xiaomiSync: (): Promise<{ synced: boolean }> =>
     api.post('/system/xiaomi/sync').then((res) => res.data),
+  syncXiaomiLocalBreakers: (): Promise<{
+    ok: boolean;
+    total: number;
+    updated: number;
+    skipped: Array<{ did: string; name: string; reason: string }>;
+  }> => api.post('/system/xiaomi/local/sync-breakers', {}).then((res) => res.data),
   controlAllDevices: (action: 'on' | 'off', siteId?: string): Promise<{ ok: boolean; action: 'on' | 'off'; total: number; success: number; failed: number }> =>
     api.post('/system/devices/control-all', { action, siteId }).then((res) => res.data),
   controlDevice: (did: string, action: 'on' | 'off'): Promise<{ ok: boolean; did: string; action: 'on' | 'off' }> =>
@@ -360,6 +558,24 @@ export const system = {
       concurrency: 40,
       pingTimeoutMs: 800,
     }).then((res) => res.data),
+  listLanScanHistory: (): Promise<{ items: LanScanHistoryItem[] }> =>
+    api.get('/system/lan-scans').then((res) => res.data),
+  clearLanScanHistory: (): Promise<{ ok: boolean }> =>
+    api.delete('/system/lan-scans').then((res) => res.data),
+  getLanCameraFeatures: (did: string): Promise<CameraFeatureState> =>
+    api.get(`/system/cameras/lan/${did}/features`, { timeout: 20000 }).then((res) => res.data),
+  updateLanCameraFeatures: (did: string, patch: CameraFeaturePatch): Promise<CameraFeatureState> =>
+    api.put(`/system/cameras/lan/${did}/features`, patch, { timeout: 30000 }).then((res) => res.data),
+  getLanCameraDetections: (did: string): Promise<LanCameraDetections> =>
+    api.get(`/system/cameras/lan/${did}/detections`, { timeout: 30000 }).then((res) => res.data),
+  setLanCameraDetection: (
+    did: string,
+    feature: 'human' | 'intrusion',
+    enabled: boolean,
+  ): Promise<LanCameraDetections> =>
+    api
+      .post(`/system/cameras/lan/${did}/detections`, { feature, enabled }, { timeout: 30000 })
+      .then((res) => res.data),
   persistLanDevices: (items: Array<{
     ip: string;
     mac: string | null;
@@ -379,6 +595,25 @@ export const system = {
     categorySummary: Record<string, number>;
     errors: Array<{ mac: string | null; ip: string; name?: string | null; message: string }>;
   }> => api.post('/system/lan-device/persist', { items }).then((res) => res.data),
+  // ─── 添加设备向导：局域网设备详情探测 + 手动添加 ───
+  probeLanDevices: (items: Array<{
+    ip: string;
+    mac?: string | null;
+    vendor?: string | null;
+    name?: string | null;
+    hostname?: string | null;
+  }>): Promise<{ total: number; devices: LanProbeDeviceDetail[] }> =>
+    api.post('/system/lan-scan/probe', { items }, { timeout: 240_000 }).then((res) => res.data),
+  manualAddDevice: (data: {
+    name: string;
+    ip: string;
+    mac?: string | null;
+    category: string;
+    vendor?: string | null;
+    model?: string | null;
+    roomId?: string | null;
+  }): Promise<{ did: string; name: string; category: string; isNew: boolean }> =>
+    api.post('/system/device/manual', data).then((res) => res.data),
   getDeviceSnapshotUrl: (did: string, options?: { fresh?: boolean }): string => {
     const base = `${getApiBaseUrl()}/system/device/${encodeURIComponent(did)}/snapshot`;
     const token = useAuthStore.getState().token;
@@ -403,6 +638,60 @@ export const system = {
     api.put(`/system/device/${did}/category`, { category }).then((res) => res.data),
   deleteDevice: (did: string): Promise<{ did: string }> =>
     api.delete(`/system/device/${did}`).then((res) => res.data),
+  // ─── 统一摄像头管理（局域网 ONVIF/RTSP + 米家云） ───
+  listCameras: (): Promise<CameraListResponse> =>
+    api.get('/system/cameras').then((res) => res.data),
+  discoverLanCameras: (): Promise<{ devices: OnvifDiscoveredCamera[]; errorMessage?: string }> =>
+    api.post('/system/cameras/discover').then((res) => res.data),
+  probeLanCamera: (data: {
+    ip: string;
+    port?: number;
+    username?: string;
+    password?: string;
+    brand?: string | null;
+    rtspUrl?: string | null;
+  }): Promise<LanCameraProbeResult> =>
+    api.post('/system/cameras/probe', data).then((res) => res.data),
+  createLanCamera: (data: LanCameraSavePayload): Promise<LanCameraSaveResult> =>
+    api.post('/system/cameras/lan', data).then((res) => res.data),
+  updateLanCamera: (did: string, data: LanCameraSavePayload): Promise<LanCameraSaveResult> =>
+    api.put(`/system/cameras/lan/${encodeURIComponent(did)}`, data).then((res) => res.data),
+  deleteLanCamera: (did: string): Promise<{ did: string; deleted: boolean }> =>
+    api.delete(`/system/cameras/lan/${encodeURIComponent(did)}`).then((res) => res.data),
+  controlLanCameraPtz: (
+    did: string,
+    data: { action: 'left' | 'right' | 'up' | 'down' | 'zoomIn' | 'zoomOut' | 'stop' | 'home' | 'gotoPreset'; speed?: number; presetToken?: string; durationMs?: number },
+  ): Promise<{ did: string; ok: boolean; supported: boolean; message?: string }> =>
+    api.post(`/system/cameras/lan/${encodeURIComponent(did)}/ptz`, data).then((res) => res.data),
+  getLanCameraPtzPresets: (did: string): Promise<{ did: string; ok: boolean; supported: boolean; presets: { token: string; name: string }[]; message?: string }> =>
+    api.get(`/system/cameras/lan/${encodeURIComponent(did)}/ptz/presets`).then((res) => res.data),
+  getLanCameraConfig: (did: string): Promise<{
+    did: string;
+    config: {
+      source: 'onvif' | 'rtsp';
+      ip: string;
+      port: number;
+      username: string;
+      password: string;
+      brand: string | null;
+      model: string | null;
+      rtspUrl: string;
+      subRtspUrl: string | null;
+      snapshotUrl: string | null;
+      hasPTZ: boolean;
+      transcodeH264: boolean;
+      preferSubStream?: boolean;
+      capabilities?: CameraFeatureCapabilities;
+      addedAt: string | null;
+      updatedAt: string | null;
+    };
+  }> => api.get(`/system/cameras/lan/${encodeURIComponent(did)}/config`).then((res) => res.data),
+  testLanCamera: (did: string): Promise<{
+    did: string;
+    rtspUrl: string | null;
+    rtspTest: { ok: boolean; url: string; errorMessage?: string; videoInfo?: string | null } | null;
+    stream: { hlsUrl: string | null; hlsReady: boolean; errorMessage?: string } | null;
+  }> => api.post(`/system/cameras/lan/${encodeURIComponent(did)}/test`).then((res) => res.data),
   xiaomiCameraLogin: (params?: {
     username?: string;
     password?: string;
@@ -559,7 +848,7 @@ export const system = {
     errorMessage?: string;
   }> =>
     api.post(`/system/device/${did}/camera_ptz`, { direction, speed }).then((res) => res.data),
-  startCameraRecording: (did: string, opts?: { mode?: 'motion' | 'continuous'; segmentMinutes?: number }): Promise<{
+  startCameraRecording: (did: string, opts?: { mode?: 'motion' | 'person' | 'continuous'; segmentMinutes?: number }): Promise<{
     did: string;
     recording: boolean;
     mode?: 'motion' | 'continuous';
@@ -569,7 +858,7 @@ export const system = {
   }> => api.post(`/system/device/${did}/camera_record/start`, opts ?? {}).then((res) => res.data),
   stopCameraRecording: (did: string): Promise<{ did: string; recording: boolean }> =>
     api.post(`/system/device/${did}/camera_record/stop`).then((res) => res.data),
-  getCameraRecordingStatus: (did: string): Promise<{ did: string; recording: boolean; mode?: 'motion' | 'continuous' | null }> =>
+  getCameraRecordingStatus: (did: string): Promise<{ did: string; recording: boolean; mode?: 'motion' | 'person' | 'continuous' | null }> =>
     api.get(`/system/device/${did}/camera_record/status`).then((res) => res.data),
   listCameraRecordings: (did: string): Promise<{
     did: string;

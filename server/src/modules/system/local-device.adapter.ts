@@ -1,5 +1,6 @@
 import axios from 'axios';
 import net from 'net';
+import { readBreakerState, setBreakerPower } from './lib/miio-lan';
 
 /**
  * 通用局域网设备适配器：
@@ -38,8 +39,9 @@ export interface LocalControlConfig {
   // ── 涂鸦本地（占位）──
   tuyaDeviceId?: string;
   tuyaLocalKey?: string;
-  // ── MiIO LAN（占位）──
+  // ── MiIO LAN ──
   miioToken?: string;
+  miioDid?: string;
 }
 
 export interface LocalDeviceState {
@@ -273,8 +275,14 @@ export const localDeviceAdapter = {
         return;
       case 'tuya_local':
         throw new Error('涂鸦本地协议暂未支持，请选择 HTTP 或 Modbus TCP');
-      case 'miio_lan':
-        throw new Error('MiIO LAN 协议暂未支持，请选择 HTTP 或 Modbus TCP');
+      case 'miio_lan': {
+        const ok = await setBreakerPower(
+          { ip: localip, token: String(cfg.miioToken || ''), did: String(cfg.miioDid || '') },
+          action === 'on',
+        );
+        if (!ok) throw new Error('MiIO 本地控制失败（请检查 token / IP / DID）');
+        return;
+      }
       default:
         throw new Error(`未知的控制协议：${(cfg as any)?.protocol}`);
     }
@@ -294,6 +302,21 @@ export const localDeviceAdapter = {
           return await httpReadState(cfg);
         case 'modbus_tcp':
           return { on: await modbusReadCoil(localip, cfg), reachable: true };
+        case 'miio_lan': {
+          const state = await readBreakerState({
+            ip: localip,
+            token: String(cfg.miioToken || ''),
+            did: String(cfg.miioDid || ''),
+          });
+          if (!state) return { on: null, reachable: false, error: 'MiIO 无响应' };
+          return {
+            on: state.power,
+            powerW: state.powerW,
+            currentA: state.currentA,
+            voltageV: state.voltageV,
+            reachable: true,
+          };
+        }
         default:
           return { on: null, reachable: true };
       }

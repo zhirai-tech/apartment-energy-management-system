@@ -436,7 +436,7 @@ Recommended production deployment model:
 
 ## Contact
 
-- Technical Support: [xtang3125@gmail.com](mailto:xtang3125@gmail.com)
+- Technical Support: [support@example.com](mailto:support@example.com)
 - QQ: 2499174616
 - QQ Link: https://qm.qq.com/q/1VBrKTDp0A
 
@@ -456,3 +456,8 @@ Not allowed:
 - Commercial use
 - Paid redistribution
 - Direct use in commercial products or services
+
+## 安全说明
+
+- 仓库只包含源代码、部署脚本模板与文档，不包含数据库数据、电费记录、摄像头截图、账号密码或会话令牌；
+- 本地部署脚本（`deploy/remote/`、`deploy/ssh-helper.ps1`）与截图（`docs/images/`）已被 `.gitignore` 排除；实际部署时请根据 `.env.example` 配置自己的环境变量。

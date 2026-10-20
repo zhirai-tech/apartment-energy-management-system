@@ -5,7 +5,7 @@ services:
     restart: always
     environment:
       POSTGRES_USER: zaem
-      POSTGRES_PASSWORD: zaem_password
+      POSTGRES_PASSWORD: change_me_password
       POSTGRES_DB: zaem_db
     ports:
       - "5433:5432"
@@ -58,7 +58,7 @@ services:
       - "3011:3001"
     environment:
       NODE_ENV: production
-      DATABASE_URL: postgresql://zaem:zaem_password@postgres:5432/zaem_db?schema=public
+      DATABASE_URL: postgresql://zaem:change_me_password@postgres:5432/zaem_db?schema=public
       REDIS_URL: redis://redis:6379
       JWT_SECRET: ${JWT_SECRET:-zaem_jwt_secret_change_in_production}
       PORT: 3001

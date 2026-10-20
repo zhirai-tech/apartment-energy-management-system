@@ -98,7 +98,7 @@ export function RoomDetailDialog({
   const [cameraCaps, setCameraCaps] = useState<CameraCapabilities | null>(null);
   const [capLoading, setCapLoading] = useState(false);
   // 录制模式：motion 智能侦测 / continuous 连续定时
-  const [recMode, setRecMode] = useState<'motion' | 'continuous'>('motion');
+  const [recMode, setRecMode] = useState<'motion' | 'person' | 'continuous'>('motion');
   const [continuousMinutes, setContinuousMinutes] = useState(30);
   // 录像文件列表
   const [recordings, setRecordings] = useState<Array<{ name: string; size: number; mtime: number; url: string }>>([]);
@@ -297,15 +297,26 @@ export function RoomDetailDialog({
     let destroyed = false;
     const run = async () => {
       const canNative = typeof videoEl.canPlayType === 'function' && videoEl.canPlayType('application/vnd.apple.mpegurl');
-      if (canNative) {
-        videoEl.src = hlsUrl;
-        try { await videoEl.play(); } catch {}
-        setStreamVideoBroken(false);
+      // 优先 hls.js（MSE）；桌面 Chrome 原生 HLS 解码 MPEG-TS 常报 DEMUXER_ERROR 黑屏
+      let Hls: any = null;
+      try {
+        Hls = (await import('hls.js')).default;
+      } catch {
+        Hls = null;
+      }
+      const hlsSupported = !!(Hls && typeof Hls.isSupported === 'function' && Hls.isSupported());
+      if (!hlsSupported) {
+        if (canNative) {
+          videoEl.src = hlsUrl;
+          try { await videoEl.play(); } catch {}
+          setStreamVideoBroken(false);
+        } else {
+          setStartStreamError('当前浏览器不支持 HLS 播放');
+        }
         return;
       }
       try {
-        const Hls = (await import('hls.js')).default;
-        if (!Hls || !Hls.isSupported()) {
+        if (!Hls || !hlsSupported) {
           setStartStreamError('当前浏览器不支持 HLS 播放');
           return;
         }
@@ -502,7 +513,7 @@ export function RoomDetailDialog({
     try {
       const status = await system.getCameraRecordingStatus(deviceDid);
       setRecordingActive(status.recording);
-      if (status.mode) setRecMode(status.mode);
+      if (status.mode === 'motion' || status.mode === 'person' || status.mode === 'continuous') setRecMode(status.mode);
     } catch {
       /* noop */
     }
@@ -1495,7 +1506,7 @@ export function RoomDetailDialog({
               <div className="inline-flex flex-wrap items-center gap-1.5">
                 <Select
                   value={recMode}
-                  onValueChange={(v) => setRecMode(v as 'motion' | 'continuous')}
+                  onValueChange={(v) => setRecMode(v as 'motion' | 'person' | 'continuous')}
                   disabled={recordingActive || !canControl}
                 >
                   <SelectTrigger className="h-7 w-auto gap-1 text-[11px]">

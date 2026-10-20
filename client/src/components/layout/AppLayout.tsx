@@ -12,6 +12,7 @@ import {
   Film,
   MonitorPlay,
   FileDown,
+  Wifi,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { Button } from '../ui/button';
@@ -27,6 +28,7 @@ const menuItems = [
   { to: '/', icon: Home, label: '仪表盘', end: true },
   { to: '/charts', icon: BarChart3, label: '图表' },
   { to: '/system', icon: Settings, label: '系统设置' },
+  { to: '/network-devices', icon: Wifi, label: '网络设备' },
   { to: '/logs/operations', icon: List, label: '操作日志' },
   { to: '/logs/alarms', icon: Bell, label: '报警中心' },
   { to: '/recordings', icon: Film, label: '录像回放' },

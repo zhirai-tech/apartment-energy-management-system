@@ -75,7 +75,6 @@ import {
 } from '../ui/select';
 import { useAuthStore } from '../../store/auth';
 import { DashboardSpaceCard, floorToDualLabel } from './RoomsGrid';
-import { RoomDetailDialog } from './RoomDetailDialog';
 import { FeeHint } from '../ui/fee-hint';
 
 interface RoomCardProps {
@@ -125,7 +124,6 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
   const [savingLimit, setSavingLimit] = useState(false);
   const [limitTogglePending, setLimitTogglePending] = useState(false);
   const [costLimitTogglePending, setCostLimitTogglePending] = useState(false);
-  const [cameraDetailOpen, setCameraDetailOpen] = useState(false);
   const [cameraSnapshotBump, setCameraSnapshotBump] = useState(0);
   const snapshotThumbReloadRef = useRef<number>(0);
   const [takeSnapshotLoading, setTakeSnapshotLoading] = useState(false);
@@ -314,7 +312,7 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
       primaryCategory === DeviceCategory.CAMERA &&
       deviceDid === deepLinkCameraDid
     ) {
-      setCameraDetailOpen(true);
+      navigate('/cameras');
       const next = new URLSearchParams(searchParams);
       next.delete('camera');
       setSearchParams(next, { replace: true });
@@ -479,7 +477,7 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
   const handleOpenDetail = () => {
     if (editingName) return;
     if (primaryCategory === DeviceCategory.CAMERA) {
-      setCameraDetailOpen(true);
+      navigate('/cameras');
       return;
     }
     if (primaryCategory === DeviceCategory.WIFI_AP || primaryCategory === DeviceCategory.FIVE_G_CPE) {
@@ -559,7 +557,7 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
     let stallTimer: ReturnType<typeof setTimeout> | null = null;
     const triggerCardReconnect = () => {
       if (stallTimer) return;
-      if (cardReconnectAttemptRef.current >= 3) return;
+      if (cardReconnectAttemptRef.current >= 12) return;
       cardReconnectAttemptRef.current += 1;
       stallTimer = setTimeout(() => {
         stallTimer = null;
@@ -588,23 +586,32 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
       const canNative =
         typeof videoEl.canPlayType === 'function' &&
         videoEl.canPlayType('application/vnd.apple.mpegurl');
-      if (canNative) {
-        videoEl.src = url;
-        try { await videoEl.play(); } catch {}
+      // 优先 hls.js（MSE）：桌面 Chrome 原生 HLS 解码 MPEG-TS 常报 DEMUXER_ERROR 黑屏，
+      // 仅当浏览器不支持 MSE 时才退回原生 HLS（iOS Safari）。
+      let Hls: any = null;
+      try {
+        Hls = (await import('hls.js')).default;
+      } catch {
+        Hls = null;
+      }
+      const hlsSupported = !!(Hls && typeof Hls.isSupported === 'function' && Hls.isSupported());
+      if (!hlsSupported) {
+        if (canNative) {
+          videoEl.src = url;
+          try { await videoEl.play(); } catch {}
+        }
         return;
       }
       try {
-        const Hls = (await import('hls.js')).default;
-        if (!Hls || !Hls.isSupported()) return;
+        if (!Hls || !hlsSupported) return;
         const hls = new Hls({
-          lowLatencyMode: true,
+          lowLatencyMode: false,
           enableWorker: true,
-          liveSyncDurationCount: 2,
-          liveMaxLatencyDurationCount: 4,
-          maxBufferLength: 8,
-          maxMaxBufferLength: 12,
-          backBufferLength: 3,
-          maxLiveSyncPlaybackRate: 1.5,
+          liveSyncDurationCount: 3,
+          liveMaxLatencyDurationCount: 10,
+          maxBufferLength: 12,
+          maxMaxBufferLength: 30,
+          backBufferLength: 10,
           initialLiveManifestSize: 1,
           manifestLoadingMaxRetry: 6,
           manifestLoadingRetryDelay: 500,
@@ -1139,7 +1146,7 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
                     className="rounded-full bg-black/55 p-1 text-white/85 hover:bg-black/70"
                     onClick={(event) => {
                       event.stopPropagation();
-                      setCameraDetailOpen(true);
+                      navigate('/cameras');
                     }}
                     title="查看画面"
                   >
@@ -1620,7 +1627,7 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
                   className="h-8 min-w-0 flex-1 basis-[120px] text-[clamp(0.72rem,0.95vw,0.78rem)] bg-indigo-600 hover:bg-indigo-700"
                   onClick={(event) => {
                     event.stopPropagation();
-                    setCameraDetailOpen(true);
+                    navigate('/cameras');
                   }}
                 >
                   查看详情
@@ -1931,21 +1938,6 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
       </DialogContent>
     </Dialog>
 
-
-    <RoomDetailDialog
-      room={room}
-      firstDevice={firstDevice}
-      deviceDid={deviceDid}
-      canControl={canControl}
-      open={cameraDetailOpen}
-      onOpenChange={setCameraDetailOpen}
-      onSnapshotBump={() => {
-        setCameraSnapshotBump((prev) => prev + 1);
-        snapshotThumbReloadRef.current += 1;
-      }}
-      onTakeSnapshot={() => void handleTakeEvidenceSnapshot()}
-      takeSnapshotLoading={takeSnapshotLoading}
-    />
 
     <Dialog
       open={networkDetailOpen}

@@ -1,7 +1,8 @@
 import cron from 'node-cron';
-import { OperationType } from '@prisma/client';
+import { DeviceStatus, OperationType } from '@prisma/client';
 import prisma from './prisma';
 import { xiaomiAdapter } from '../modules/system/xiaomi.adapter';
+import { readBreakerState } from '../modules/system/lib/miio-lan';
 import { systemService } from '../modules/system/system.service';
 import { writeOperation } from './logger';
 import {
@@ -243,7 +244,8 @@ async function syncDataTask(): Promise<void> {
   try {
     await xiaomiAdapter.refreshAllRoomsRealtime();
     await systemService.refreshLanCameraStatuses().catch(() => {});
-    await systemService.refreshDashboardNetworkRuntimes().catch(() => {});
+    // 主路由约每小时刷新一次即可；Nokia 放大器不再自动轮询，避免把它弱小的网页后台打出 503
+    await systemService.refreshDashboardNetworkRuntimes(60 * 60_000).catch(() => {});
     const businessTimeZone = await systemService.getSetting(
       'businessTimezone',
       DEFAULT_BUSINESS_TIMEZONE,
@@ -294,6 +296,85 @@ async function syncDataTask(): Promise<void> {
   }
 }
 
+let miioLocalPollBusy = false;
+// 空开本地轮询：连续失败 3 次才判定离线（避免单次 UDP 丢包误报离线）
+const miioLocalFailCounts = new Map<string, number>();
+
+/**
+ * 米家空开本地轮询：每 10 秒通过局域网 miIO 直连读取功率/电流/电压/累计电量，
+ * 断外网也能持续更新（不依赖米家云）。
+ */
+async function miioLocalPollTask(): Promise<void> {
+  if (miioLocalPollBusy) return;
+  miioLocalPollBusy = true;
+  try {
+    const devices = await prisma.device.findMany({
+      where: { controlProtocol: 'miio_lan' },
+      select: { did: true, localip: true, controlConfig: true, roomId: true },
+    });
+    if (devices.length === 0) return;
+    let updated = 0;
+    await Promise.all(
+      devices.map(async (device) => {
+        let cfg: any = device.controlConfig;
+        if (typeof cfg === 'string') {
+          try {
+            cfg = JSON.parse(cfg);
+          } catch {
+            cfg = {};
+          }
+        }
+        const token = cfg?.miioToken ? String(cfg.miioToken) : '';
+        if (!device.localip || token.length !== 32) return;
+        const state = await readBreakerState({ ip: device.localip, token, did: device.did }).catch(() => null);
+        try {
+          if (!state) {
+            const fails = (miioLocalFailCounts.get(device.did) ?? 0) + 1;
+            miioLocalFailCounts.set(device.did, fails);
+            if (fails >= 3) {
+              await prisma.device.update({
+                where: { did: device.did },
+                data: { status: DeviceStatus.offline, lastSyncAt: new Date() },
+              });
+            }
+            return;
+          }
+          miioLocalFailCounts.set(device.did, 0);
+          await prisma.device.update({
+            where: { did: device.did },
+            data: {
+              status: DeviceStatus.online,
+              power: state.power,
+              powerW: state.powerW,
+              currentA: state.currentA,
+              voltageV: state.voltageV,
+              totalKwh: state.totalKwh,
+              lastSyncAt: new Date(),
+            },
+          });
+          // 状态校准：设备实际处于通电状态时，清除数据库里残留的“已断电”标记，
+          // 避免出现“页面显示已断电、实际却在用电”的不一致。
+          if (state.power === true && device.roomId) {
+            await prisma.room
+              .updateMany({
+                where: { id: device.roomId, cutoff: true },
+                data: { cutoff: false, status: 'normal' as any },
+              })
+              .catch(() => {});
+          }
+          updated += 1;
+        } catch {
+          /* 单台失败不影响其他设备 */
+        }
+      }),
+    );
+    if (updated > 0) {
+      await broadcastDashboard().catch(() => {});
+    }
+  } finally {
+    miioLocalPollBusy = false;
+  }
+}
 export async function startCronJobs(): Promise<void> {
   const minute = 5;
 
@@ -334,4 +415,10 @@ export async function startCronJobs(): Promise<void> {
 
   // Start one real sync immediately so the detail page does not wait for the next minute tick.
   await syncDataTask().catch(() => {});
+
+  // 米家空开本地直连轮询（10 秒一次，断外网可用）
+  await miioLocalPollTask().catch(() => {});
+  setInterval(() => {
+    miioLocalPollTask().catch(() => {});
+  }, 10_000);
 }

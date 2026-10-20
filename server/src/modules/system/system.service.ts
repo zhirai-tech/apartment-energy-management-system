@@ -32,7 +32,8 @@ import { OperationActorContext } from '../../lib/operation-log';
 import { formatRoomDisplayName, normalizeRoomAnnotation } from '../../lib/room-display';
 import { resolveOfflineSince } from '../../lib/device-runtime';
 import { buildBasicAuthHeader, buildBasicAuthToken, buildDigestAuthHeader, normalizeAuthType } from '../../lib/http-auth';
-import { CloudHlsProxyManager } from './lib/cloud-hls-proxy';
+import { CloudHlsProxyManager, pruneStaleHlsSegments, latestReferencedSegmentAgeMs } from './lib/cloud-hls-proxy';
+import { startOnvifEventWatcher, type OnvifEventWatcherHandle } from './lib/onvif-events';
 import crypto from 'crypto';
 import axios from 'axios';
 import path from 'path';
@@ -70,6 +71,10 @@ interface CameraArmState {
   stagingDir: string | null;
   liveDir: string | null;
   pollTimer: NodeJS.Timeout | null;
+  /** 触发方式：motion=服务端画面变化检测；person=ONVIF 人形/移动事件 */
+  mode: 'motion' | 'person';
+  /** ONVIF 事件订阅句柄（person 模式） */
+  personWatcher: OnvifEventWatcherHandle | null;
 }
 
 interface ContinuousRecordingState {
@@ -77,7 +82,34 @@ interface ContinuousRecordingState {
   proc: ChildProcessByStdio<null, NodeReadable, NodeReadable> | null;
   startedAt: number;
   segmentMinutes: number;
+  /** ffmpeg 意外退出后的自动重启次数（摄像机 WiFi 抖动/短暂断流时自动续录） */
+  restarts?: number;
+  restartTimer?: NodeJS.Timeout | null;
 }
+
+// 局域网 RTSP → 本地 ffmpeg HLS 代理的进程状态（带看门狗自动恢复）
+interface CameraStreamEntry {
+  proc: ChildProcessByStdio<null, NodeReadable, NodeReadable> | null;
+  startedAt: number;
+  rtspUrl: string;
+  hlsDir: string;
+  /** 主动停止标记：为 true 时 ffmpeg 退出后不再自动重启 */
+  stopping: boolean;
+  restartTimer: NodeJS.Timeout | null;
+  /** 停滞检测定时器（进程活着但 m3u8/TS 不更新时杀进程触发重启） */
+  watchdog: NodeJS.Timeout | null;
+  /** 连续异常退出后已自动重启的次数（用于限制无限重启） */
+  restartAttempts: number;
+}
+
+// 局域网代理看门狗参数：3~5s 延迟重启，最多连续 5 次，超出后等待下一次 ensure() 重置
+const STREAM_PROXY_MAX_RESTART = 20;
+const STREAM_PROXY_RESTART_DELAY_MS = 3000;
+// 停滞判定：playlist 超过 15s 未更新，或最新分片超过 20s 未更新；首片宽限 25s
+const STREAM_PROXY_WATCHDOG_INTERVAL_MS = 2000;
+const STREAM_PROXY_STALL_PLAYLIST_MS = 5000;
+const STREAM_PROXY_STALL_TS_MS = 6000;
+const STREAM_PROXY_FIRST_SEGMENT_GRACE_MS = 15000;
 
 // 录制计划规则：mode=motion 智能侦测录像 / continuous 连续录像；days 0=周日…6=周六
 export interface CameraScheduleRule {
@@ -91,12 +123,7 @@ export interface CameraScheduleRule {
 }
 
 class SystemService {
-  private cameraStreamProcesses = new Map<string, {
-    proc: ChildProcessByStdio<null, NodeReadable, NodeReadable>;
-    startedAt: number;
-    rtspUrl: string;
-    hlsDir: string;
-  }>();
+  private cameraStreamProcesses = new Map<string, CameraStreamEntry>();
 
   // 云端 HLS 本地代理（自动续流）：逻辑已拆至 ./lib/cloud-hls-proxy.ts，
   // SystemService 仅保留对外委托接口（controller 调用不变）。
@@ -105,6 +132,8 @@ class SystemService {
     isHlsReady: (out, maxAgeMs) => this.isHlsReady(out, maxAgeMs),
     waitForHlsReadyOrExit: (did, timeoutMs) => this.waitForHlsReadyOrExit(did, timeoutMs),
     buildInputArgs: (url) => this.buildInputArgs(url),
+    // camera 会话被自动/手动重登刷新后，代理清除冷却与失败计数立即恢复
+    cameraSessionUpdatedAt: () => xiaomiAdapter.getCameraSessionUpdatedAt(),
   });
 
   private cameraArmStates = new Map<string, CameraArmState>();
@@ -287,14 +316,23 @@ class SystemService {
 
   /**
    * HLS 是否就绪：m3u8 必须存在、非空且最近被刷新（实时流不断重写），
-   * 防止把残留的旧录像文件误判为实时流（此前导致前端播放过期录像）。
+   * 且至少有一个被 playlist 引用的分片真实存在——避免"只有 playlist 没有分片"或
+   * 残留旧录像文件被误判为实时流（此前导致前端播放过期录像/拿到 404 URL）。
    */
   public isHlsReady(hlsOutFile: string, maxAgeMs = 8000): boolean {
     try {
       if (!fs.existsSync(hlsOutFile)) return false;
       const st = fs.statSync(hlsOutFile);
       if (st.size <= 0) return false;
-      return Date.now() - st.mtimeMs < maxAgeMs;
+      if (Date.now() - st.mtimeMs >= maxAgeMs) return false;
+      const dir = path.dirname(hlsOutFile);
+      const content = fs.readFileSync(hlsOutFile, 'utf8');
+      for (const line of content.split(/\r?\n/)) {
+        const t = line.trim();
+        if (!t || t.startsWith('#') || !/\.(ts|m4s)$/i.test(t)) continue;
+        if (fs.existsSync(path.join(dir, path.basename(t)))) return true;
+      }
+      return false;
     } catch {
       return false;
     }
@@ -324,8 +362,8 @@ class SystemService {
     while (Date.now() < deadline) {
       if (this.isHlsReady(hlsOutFile)) return true;
       const existing = this.cameraStreamProcesses.get(safeDid);
-      if (existing?.proc && existing.proc.exitCode !== null) {
-        // ffmpeg 已退出：没有出流就是失败，马上返回
+      if (!existing?.proc || existing.proc.exitCode !== null) {
+        // ffmpeg 进程不存在或已退出：没有出流就是失败，马上返回（不等超时）
         return this.isHlsReady(hlsOutFile);
       }
       await new Promise((resolve) => setTimeout(resolve, 300));
@@ -379,6 +417,8 @@ class SystemService {
     const cfgWithProtocol = {
       ...((cfg && typeof cfg === 'object' ? cfg : {}) as object),
       protocol: device.controlProtocol,
+      // MiIO 局域网控制需要 did 参与协议握手校验
+      miioDid: device.did,
     };
     try {
       await localDeviceAdapter.control(device.localip, cfgWithProtocol as any, action);
@@ -551,9 +591,12 @@ class SystemService {
         ffmpegAvailable,
       };
     }
-
-    if (existing && existing.proc) {
-      try { existing.proc.kill('SIGKILL'); } catch { /* noop */ }
+    // URL 变更或旧进程已死：取消挂起的重启排程、标记停止、杀掉旧进程
+    if (existing) {
+      if (existing.restartTimer) { clearTimeout(existing.restartTimer); existing.restartTimer = null; }
+      if (existing.watchdog) { clearInterval(existing.watchdog); existing.watchdog = null; }
+      existing.stopping = true;
+      if (existing.proc && !existing.proc.killed) { try { existing.proc.kill('SIGKILL'); } catch { /* noop */ } }
       this.cameraStreamProcesses.delete(safeDid);
     }
 
@@ -571,98 +614,203 @@ class SystemService {
         errorMessage: `创建 HLS 切片目录失败：${err?.message || String(err)}`,
       };
     }
+    // 注意：不再预先清空目录。新流 ready 之前保留旧 m3u8/ts（旧流可能仍被前端播放），
+    // 新流产出后由看门狗 pruneStaleHlsSegments 清理孤儿分片。
 
-    // 启动新进程前清空旧切片，避免前端播放残留录像（旧 m3u8/ts）
-    try {
-      for (const f of fs.readdirSync(hlsDir)) {
-        if (/\.(m3u8|ts)$/i.test(f)) {
-          try { fs.unlinkSync(path.join(hlsDir, f)); } catch { /* noop */ }
-        }
-      }
-    } catch { /* noop */ }
+    const proc = this.spawnCameraFfmpeg(safeDid, rtspUrl, hlsDir, hlsOutFile, meta, null);
+    if (!proc) {
+      return {
+        hlsUrl: null,
+        webrtcUrl: null,
+        hlsReady: false,
+        proxyMode: 'none',
+        startedAt: null,
+        processId: null,
+        ffmpegAvailable,
+        errorMessage: 'ffmpeg 启动失败（请确认 ffmpeg.exe 在 PATH 或 server/ 目录）',
+      };
+    }
+    const entry = this.cameraStreamProcesses.get(safeDid);
+    const hlsReady = this.isHlsReady(hlsOutFile);
+    return {
+      hlsUrl,
+      webrtcUrl: null,
+      hlsReady,
+      proxyMode: 'ffmpeg-hls',
+      startedAt: entry?.startedAt ?? Date.now(),
+      processId: proc.pid ?? null,
+      ffmpegAvailable,
+    };
+  }
 
+  /**
+   * 启动 RTSP → 本地 ffmpeg HLS 的进程，并挂载看门狗：
+   * - ffmpeg 异常退出后，3~5s 延迟自动重启（最多 STREAM_PROXY_MAX_RESTART 次）；
+   * - 主动停止（stopCameraStreamProxy / URL 变更）时不再重启；
+   * - 重启前保留旧 m3u8/ts，新流产出后才清理孤儿分片，避免前端拿到 404。
+   */
+  private spawnCameraFfmpeg(
+    safeDid: string,
+    rtspUrl: string,
+    hlsDir: string,
+    hlsOutFile: string,
+    meta: { transcodeH264?: boolean } | undefined,
+    existing: CameraStreamEntry | null,
+  ): ChildProcessByStdio<null, NodeReadable, NodeReadable> | null {
     const ffmpegArgs = [
       ...this.buildInputArgs(rtspUrl),
       '-an',
       ...(meta?.transcodeH264
         ? ['-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-pix_fmt', 'yuv420p', '-crf', '23', '-g', '12', '-sc_threshold', '0']
         : ['-c:v', 'copy']),
-      '-hls_time', '0.5',
-      '-hls_list_size', '4',
+      '-hls_time', '1',
+      '-hls_list_size', '10',
+      '-hls_delete_threshold', '12',
       '-hls_flags', 'delete_segments+append_list+independent_segments',
       '-hls_allow_cache', '0',
+      '-max_muxing_queue_size', '1024',
       '-y',
       hlsOutFile,
     ];
     let proc: ChildProcessByStdio<null, NodeReadable, NodeReadable> | null = null;
-    let startedAt = 0;
-    let spawnError: string | null = null;
     try {
       const spawned = spawn('ffmpeg', ffmpegArgs, {
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
       });
       proc = spawned as unknown as ChildProcessByStdio<null, NodeReadable, NodeReadable>;
-      startedAt = Date.now();
-      proc.on('error', (err) => {
-        spawnError = err?.message || String(err);
-        console.warn('[StreamProxy] ffmpeg spawn error did=', safeDid, 'err=', spawnError);
+    } catch (err: any) {
+      console.warn(`[StreamProxy] ffmpeg spawn failed did=${safeDid} err=${err?.message || err}`);
+      return null;
+    }
+    if (!proc) return null;
+
+    const entry: CameraStreamEntry = existing ?? {
+      proc: null,
+      startedAt: 0,
+      rtspUrl,
+      hlsDir,
+      stopping: false,
+      restartTimer: null,
+      watchdog: null,
+      restartAttempts: 0,
+    };
+    entry.proc = proc;
+    entry.startedAt = Date.now();
+    entry.rtspUrl = rtspUrl;
+    entry.hlsDir = hlsDir;
+    entry.stopping = false;
+    this.cameraStreamProcesses.set(safeDid, entry);
+
+    // 停滞看门狗：进程活着但 m3u8 / 最新 TS 停止更新 → 杀进程，由 exit 回调走既有重启。
+    // 只杀当前进程，禁止直接启动第二个 ffmpeg。
+    if (entry.watchdog) clearInterval(entry.watchdog);
+    entry.watchdog = setInterval(() => {
+      const cur = this.cameraStreamProcesses.get(safeDid);
+      if (!cur || cur !== entry || cur.stopping) return;
+      if (!cur.proc || cur.proc.killed) return; // 进程已退出：由 exit 回调负责重启
+      if (Date.now() - cur.startedAt < STREAM_PROXY_FIRST_SEGMENT_GRACE_MS) return; // 首片宽限
+      let m3u8Fresh = false;
+      try {
+        if (fs.existsSync(hlsOutFile) && Date.now() - fs.statSync(hlsOutFile).mtimeMs < STREAM_PROXY_STALL_PLAYLIST_MS) {
+          m3u8Fresh = true;
+        }
+      } catch { /* noop */ }
+      const tsAge = latestReferencedSegmentAgeMs(hlsDir, hlsOutFile);
+      if (m3u8Fresh && tsAge < STREAM_PROXY_STALL_TS_MS) {
+        // 正常在产：清理上一轮遗留的孤儿分片
+        pruneStaleHlsSegments(hlsDir, hlsOutFile);
+        return;
+      }
+      console.warn(`[StreamProxy] stalled did=${safeDid} m3u8Fresh=${m3u8Fresh} tsAge=${tsAge === Number.POSITIVE_INFINITY ? 'inf' : Math.round(tsAge)}ms -> kill ffmpeg`);
+      try { cur.proc.kill('SIGKILL'); } catch { /* noop */ }
+    }, STREAM_PROXY_WATCHDOG_INTERVAL_MS);
+
+    let stderrBuf = '';
+    proc.on('error', (err) => {
+      console.warn('[StreamProxy] ffmpeg spawn error did=', safeDid, 'err=', err?.message || String(err));
+      const cur = this.cameraStreamProcesses.get(safeDid);
+      if (cur === entry) this.cameraStreamProcesses.delete(safeDid);
+    });
+    proc.stderr.on('data', (chunk: unknown) => {
+      stderrBuf += String(chunk || '');
+      if (stderrBuf.length > 200000) stderrBuf = stderrBuf.slice(-100000);
+    });
+    proc.stdout.on('data', () => { /* consume */ });
+
+    proc.on('exit', (code, signal) => {
+      console.warn('[StreamProxy] ffmpeg exit did=', safeDid, 'code=', code, 'signal=', signal);
+      try {
+        fs.writeFileSync(path.join(hlsDir, 'ffmpeg-stderr.log'), stderrBuf || '(empty)', 'utf8');
+      } catch { /* noop */ }
+      console.warn('[StreamProxy] ffmpeg stderr did=', safeDid, '=>', (stderrBuf || '(empty)').slice(-3000));
+      const cur = this.cameraStreamProcesses.get(safeDid);
+      if (!cur || cur !== entry) return;
+      cur.proc = null;
+      if (cur.stopping) {
+        // 主动停止：清理残留分片，避免前端播放旧录像；不自动重启
+        if (cur.watchdog) { clearInterval(cur.watchdog); cur.watchdog = null; }
         this.cameraStreamProcesses.delete(safeDid);
-      });
-      proc.on('exit', (code, signal) => {
-        console.warn('[StreamProxy] ffmpeg exit did=', safeDid, 'code=', code, 'signal=', signal);
-        // 完整 stderr 落盘，便于排查 rtsps/转码类问题（不再只保留最后 2000 字符）
-        try {
-          fs.writeFileSync(path.join(hlsDir, 'ffmpeg-stderr.log'), stderrBuf || '(empty)', 'utf8');
-        } catch { /* noop */ }
-        console.warn('[StreamProxy] ffmpeg stderr did=', safeDid, '=>', (stderrBuf || '(empty)').slice(-3000));
-        this.cameraStreamProcesses.delete(safeDid);
-        // 流已结束：删除 m3u8，避免残留旧文件被误判为 hlsReady（防止前端播放旧录像）
         try {
           if (fs.existsSync(hlsOutFile)) fs.unlinkSync(hlsOutFile);
         } catch { /* noop */ }
-      });
-      let stderrBuf = '';
-      proc.stderr.on('data', (chunk: unknown) => {
-        stderrBuf += String(chunk || '');
-        if (stderrBuf.length > 200000) stderrBuf = stderrBuf.slice(-100000);
-      });
-      proc.stdout.on('data', () => { /* consume */ });
-      this.cameraStreamProcesses.set(safeDid, {
-        proc,
-        startedAt,
-        rtspUrl,
-        hlsDir,
-      });
-    } catch (err: any) {
-      proc = null;
-      spawnError = err?.message || String(err) || 'ffmpeg 不可用（请将 ffmpeg.exe 放到 PATH 或 server/ 目录）';
-    }
+        return;
+      }
+      // 异常退出：保留旧 m3u8/ts（新流 ready 前不删除），延迟后看门狗重启
+      if (cur.restartAttempts >= STREAM_PROXY_MAX_RESTART) {
+        console.warn(`[StreamProxy] auto-restart give up did=${safeDid} attempts=${cur.restartAttempts}`);
+        return;
+      }
+      cur.restartAttempts += 1;
+      const delay = Math.min(5000, STREAM_PROXY_RESTART_DELAY_MS + cur.restartAttempts * 400);
+      cur.restartTimer = setTimeout(() => {
+        cur.restartTimer = null;
+        const now = this.cameraStreamProcesses.get(safeDid);
+        if (!now || now !== entry || now.stopping) return;
+        if (now.proc && !now.proc.killed) return; // 已被其它路径重启
+        const nproc = this.spawnCameraFfmpeg(safeDid, now.rtspUrl, now.hlsDir, hlsOutFile, meta, now);
+        if (nproc) {
+          now.proc = nproc;
+          now.startedAt = Date.now();
+          console.info(`[StreamProxy] restarted did=${safeDid} attempt=${now.restartAttempts}`);
+          // 新流启动后延迟清理上一轮遗留的孤儿分片（不删被当前 playlist 引用的分片）
+          setTimeout(() => {
+            const cur2 = this.cameraStreamProcesses.get(safeDid);
+            if (cur2 === entry) pruneStaleHlsSegments(hlsDir, hlsOutFile);
+          }, 5000);
+        } else {
+          now.restartAttempts = 0; // spawn 失败：交给下一次 ensure() 重试
+          console.warn(`[StreamProxy] restart spawn failed did=${safeDid}`);
+        }
+      }, delay);
+    });
 
-    const hlsReady = this.isHlsReady(hlsOutFile);
-    type StreamResult = {
-      hlsUrl: string | null;
-      webrtcUrl: string | null;
-      hlsReady: boolean;
-      proxyMode: 'ffmpeg-hls' | 'mediamtx' | 'none';
-      startedAt: number | null;
-      processId: number | null;
-      ffmpegAvailable: boolean;
-      errorMessage?: string;
-    };
-    const result: StreamResult = {
-      hlsUrl,
-      webrtcUrl: null,
-      hlsReady,
-      proxyMode: proc ? 'ffmpeg-hls' : 'none',
-      startedAt: proc ? startedAt : null,
-      processId: proc?.pid ?? null,
-      ffmpegAvailable,
-    };
-    if (spawnError && !proc) {
-      result.errorMessage = spawnError;
+    return proc;
+  }
+
+  public stopCameraStreamProxy(did: string): void {
+    const safeDid = String(did || '').replace(/[^a-zA-Z0-9_-]/g, '_') || 'unknown';
+    const entry = this.cameraStreamProcesses.get(safeDid);
+    if (!entry) return;
+    if (entry.restartTimer) { clearTimeout(entry.restartTimer); entry.restartTimer = null; }
+    if (entry.watchdog) { clearInterval(entry.watchdog); entry.watchdog = null; }
+    entry.stopping = true;
+    if (entry.proc && !entry.proc.killed) { try { entry.proc.kill('SIGKILL'); } catch { /* noop */ } }
+    this.cameraStreamProcesses.delete(safeDid);
+    // 主动停止：清理残留分片，避免前端播放旧录像
+    try {
+      for (const f of fs.readdirSync(entry.hlsDir)) {
+        if (/\.(m3u8|ts)$/i.test(f)) {
+          try { fs.unlinkSync(path.join(entry.hlsDir, f)); } catch { /* noop */ }
+        }
+      }
+    } catch { /* noop */ }
+  }
+
+  public stopAllCameraStreamProxies(): void {
+    for (const safeDid of Array.from(this.cameraStreamProcesses.keys())) {
+      this.stopCameraStreamProxy(safeDid);
     }
-    return result;
   }
 
   // ──── 云端 HLS 本地代理（自动续流）────────────────────────────
@@ -755,6 +903,8 @@ class SystemService {
       stagingDir: null,
       liveDir: null,
       pollTimer: null,
+      mode: 'motion',
+      personWatcher: null,
     };
 
     // 预录环形缓冲：流拷贝（保留源编码，成本最低），仅滚动保留最近约 60 秒（5s × 12 段）
@@ -814,6 +964,109 @@ class SystemService {
     return { recording: false };
   }
 
+  /**
+   * 人形事件触发录像（局域网 ONVIF 摄像头）：
+   * 预录环形缓冲 + ONVIF PullPoint 订阅人形/移动事件触发 + 尾段合并。
+   * 与 motion 模式区别：不做 ffmpeg 画面差分，直接由摄像头的人形侦测事件触发。
+   */
+  public async startPersonRecording(
+    did: string,
+    rtspUrl: string,
+    onvif: { ip: string; port: number; username: string; password: string },
+  ): Promise<{ recording: boolean; errorMessage?: string; processId?: number | null; startedAt?: number }> {
+    const safeDid = String(did || '').replace(/[^a-zA-Z0-9_-]/g, '_') || 'unknown';
+    if (!rtspUrl) {
+      return { recording: false, errorMessage: '未获取到局域网 RTSP 地址，无法录制' };
+    }
+    const existing = this.cameraArmStates.get(safeDid);
+    if (existing && this.isArmAlive(existing) && existing.rtspUrl === rtspUrl) {
+      return {
+        recording: true,
+        processId: existing.ringProc?.pid ?? null,
+        startedAt: existing.armedAt,
+      };
+    }
+    this.disarm(safeDid);
+
+    const recDir = this.getRecordingDir(safeDid);
+    const ringDir = path.join(recDir, '.ring');
+    try {
+      fs.mkdirSync(ringDir, { recursive: true });
+    } catch (err: any) {
+      return { recording: false, errorMessage: `创建录制目录失败：${err?.message || String(err)}` };
+    }
+
+    const state: CameraArmState = {
+      rtspUrl,
+      armedAt: Date.now(),
+      motionState: 'idle',
+      lastMotionAt: 0,
+      ringProc: null,
+      detectProc: null,
+      recProc: null,
+      ringDir,
+      stagingDir: null,
+      liveDir: null,
+      pollTimer: null,
+      mode: 'person',
+      personWatcher: null,
+    };
+
+    const ringArgs = [
+      ...this.buildInputArgs(rtspUrl),
+      '-an',
+      '-c:v', 'copy',
+      '-f', 'segment',
+      '-segment_time', '5',
+      '-segment_wrap', String(this.ringSegments()),
+      '-segment_format', 'mpegts',
+      '-y',
+      path.join(ringDir, 'seg_%03d.ts'),
+    ];
+    state.ringProc = this.spawnFfmpeg(ringArgs, safeDid, 'ring');
+
+    const trigger = () => {
+      const cur = this.cameraArmStates.get(safeDid);
+      if (!cur || cur !== state) return;
+      state.lastMotionAt = Date.now();
+      if (state.motionState === 'idle') {
+        this.startEvent(safeDid);
+      }
+    };
+
+    const watcher = await startOnvifEventWatcher({
+      ip: onvif.ip,
+      port: onvif.port,
+      username: onvif.username,
+      password: onvif.password,
+      onPerson: trigger,
+      // 兜底：没有人形事件上报的机型，用移动事件触发（日志里会打印 ONVIF 错误/事件）
+      onMotion: trigger,
+      onError: (message) => console.warn(`[Recording:person] did=${safeDid} ${message}`),
+    });
+    if (!watcher) {
+      this.killProc(state.ringProc);
+      state.ringProc = null;
+      return {
+        recording: false,
+        errorMessage: '该摄像头 ONVIF 人形事件订阅失败（可能不支持 PullPoint / 未开启人形侦测）',
+      };
+    }
+    state.personWatcher = watcher;
+    this.cameraArmStates.set(safeDid, state);
+
+    state.pollTimer = setInterval(() => {
+      const s = this.cameraArmStates.get(safeDid);
+      if (!s || s !== state) return;
+      if (s.motionState === 'recording' && Date.now() - s.lastMotionAt >= this.tailMs()) {
+        this.finalizeEvent(safeDid);
+      }
+    }, 500);
+
+    this.runRetentionCleanup(recDir);
+    console.info(`[Recording:person] did=${safeDid} armed，等待人形事件…`);
+    return { recording: true, processId: state.ringProc?.pid ?? null, startedAt: state.armedAt };
+  }
   // ──────────────── 智能录像内部状态机 ────────────────
 
   private motionThreshold(): number {
@@ -881,7 +1134,8 @@ class SystemService {
   public isContinuousRecording(did: string): boolean {
     const safeDid = String(did || '').replace(/[^a-zA-Z0-9_-]/g, '_') || 'unknown';
     const st = this.continuousRecordingStates.get(safeDid);
-    return !!st && !!st.proc && !st.proc.killed;
+    // 进程已退出（exitCode 非 null）时不能算作"录像中"，否则 UI 会显示假录像状态
+    return !!st && !!st.proc && !st.proc.killed && st.proc.exitCode === null;
   }
 
   public async startContinuousRecording(
@@ -907,37 +1161,59 @@ class SystemService {
     }
 
     const segmentMinutes = Math.max(1, Math.min(120, Number(opts?.segmentMinutes) || 30));
-    const stamp = () => this.tsName(new Date());
-    const args = [
+    const buildArgs = (): string[] => [
       ...this.buildInputArgs(rtspUrl),
       '-an',
       '-c:v', 'copy',
       '-f', 'segment',
       '-segment_time', String(segmentMinutes * 60),
       '-segment_format', 'mp4',
+      // 分片 MP4：即使录制中途被强杀/断电，已写入的分片仍可播放（普通 MP4 需要写 moov 才可播）
+      '-segment_format_options', 'movflags=+frag_keyframe+empty_moov+default_base_moof',
       '-reset_timestamps', '1',
       '-y',
-      path.join(recDir, `cont_${stamp()}_%04d.mp4`),
+      path.join(recDir, `cont_${this.tsName(new Date())}_%04d.mp4`),
     ];
-    const proc = this.spawnFfmpeg(args, safeDid, 'continuous');
-    if (!proc) {
-      return { recording: false, errorMessage: 'ffmpeg 不可用（请将 ffmpeg.exe 放到 PATH 或 server/ 目录）' };
-    }
     const state: ContinuousRecordingState = {
       rtspUrl,
-      proc,
+      proc: null,
       startedAt: Date.now(),
       segmentMinutes,
+      restarts: 0,
+      restartTimer: null,
     };
+    // 摄像头 WiFi 抖动会导致 ffmpeg 断流退出：自动重启续录（最多 30 次，间隔 5s），
+    // 避免"点了录像后过一会自动停止、回放里什么都没有"。
+    const spawnOne = (): boolean => {
+      const proc = this.spawnFfmpeg(buildArgs(), safeDid, 'continuous');
+      if (!proc) return false;
+      state.proc = proc;
+      proc.on('exit', () => {
+        if (this.continuousRecordingStates.get(safeDid) !== state) return;
+        if ((state.restarts ?? 0) >= 30) return;
+        state.restarts = (state.restarts ?? 0) + 1;
+        if (state.restartTimer) clearTimeout(state.restartTimer);
+        state.restartTimer = setTimeout(() => {
+          if (this.continuousRecordingStates.get(safeDid) !== state) return;
+          spawnOne();
+        }, 5000);
+      });
+      return true;
+    };
+    if (!spawnOne()) {
+      return { recording: false, errorMessage: 'ffmpeg 不可用（请将 ffmpeg.exe 放到 PATH 或 server/ 目录）' };
+    }
     this.continuousRecordingStates.set(safeDid, state);
     this.runRetentionCleanup(recDir);
-    return { recording: true, processId: proc.pid ?? null, startedAt: state.startedAt };
+    return { recording: true, processId: state.proc?.pid ?? null, startedAt: state.startedAt };
   }
 
   public stopContinuousRecording(did: string): { recording: boolean } {
     const safeDid = String(did || '').replace(/[^a-zA-Z0-9_-]/g, '_') || 'unknown';
     const st = this.continuousRecordingStates.get(safeDid);
     if (st) {
+      if (st.restartTimer) clearTimeout(st.restartTimer);
+      st.restartTimer = null;
       this.killProc(st.proc);
       this.continuousRecordingStates.delete(safeDid);
     }
@@ -945,9 +1221,12 @@ class SystemService {
   }
 
   // 摄像头当前录制状态汇总：motion 智能侦测 / continuous 连续
-  public getCameraRecordingState(did: string): { did: string; recording: boolean; mode: 'motion' | 'continuous' | null } {
+  public getCameraRecordingState(did: string): { did: string; recording: boolean; mode: 'motion' | 'person' | 'continuous' | null } {
     const safeDid = String(did || '').replace(/[^a-zA-Z0-9_-]/g, '_') || 'unknown';
-    if (this.isMotionRecording(safeDid)) return { did, recording: true, mode: 'motion' };
+    const armState = this.cameraArmStates.get(safeDid);
+    if (armState && this.isMotionRecording(safeDid)) {
+      return { did, recording: true, mode: armState.mode === 'person' ? 'person' : 'motion' };
+    }
     if (this.isContinuousRecording(safeDid)) return { did, recording: true, mode: 'continuous' };
     return { did, recording: false, mode: null };
   }
@@ -1055,7 +1334,9 @@ class SystemService {
       const model = device?.model ?? '';
       const xiaomiDid = this.resolveXiaomiDid(model, rule.did);
       const scope = this.resolveXiaomiScope(model);
-      let rtspUrl = await this.resolveLocalGo2rtcRtsp(xiaomiDid);
+      // 局域网摄像头：直接用设备自己的 RTSP 源
+      const lanRtsp = this.resolveLanCameraRtspFromModel(model);
+      let rtspUrl = lanRtsp ?? (await this.resolveLocalGo2rtcRtsp(xiaomiDid));
       if (!rtspUrl) {
         const rtspInfo = await xiaomiAdapter.startRTSPStream(xiaomiDid, model, scope);
         rtspUrl = rtspInfo.rtspUrl;
@@ -1090,6 +1371,22 @@ class SystemService {
       return parsed && parsed.sourceScope === 'main' ? 'main' : 'camera';
     } catch {
       return 'camera';
+    }
+  }
+
+  /** 从 model JSON 的 camera.lan 配置中取局域网摄像头 RTSP 源（录制计划引擎用，优先子码流） */
+  private resolveLanCameraRtspFromModel(model: string): string | null {
+    try {
+      const parsed = model ? JSON.parse(model) : null;
+      const cam = parsed && parsed.camera && typeof parsed.camera === 'object' ? parsed.camera : null;
+      const lan = cam && cam.lan && typeof cam.lan === 'object' ? cam.lan : null;
+      if (!lan) return null;
+      const rtsp = typeof lan.rtspUrl === 'string' ? lan.rtspUrl.trim() : '';
+      const sub = typeof lan.subRtspUrl === 'string' ? lan.subRtspUrl.trim() : '';
+      const preferSub = lan.preferSubStream !== false;
+      return (preferSub && sub ? sub : rtsp) || null;
+    } catch {
+      return null;
     }
   }
 
@@ -1135,24 +1432,31 @@ class SystemService {
     try {
       const spawned = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
       proc = spawned as unknown as ChildProcessByStdio<null, NodeReadable, NodeReadable>;
+      // 始终消费 stderr：既避免管道写满导致 ffmpeg 阻塞，也保留最后几行用于排障。
+      const stderrTail: string[] = [];
+      let stderrBuf = '';
+      proc.stderr.on('data', (chunk: unknown) => {
+        stderrBuf += String(chunk || '');
+        const lines = stderrBuf.split(/\r?\n/);
+        stderrBuf = lines.pop() ?? '';
+        for (const line of lines) {
+          const trimmed = String(line).trim();
+          if (!trimmed) continue;
+          stderrTail.push(trimmed);
+          if (stderrTail.length > 20) stderrTail.shift();
+          if (onStderrLine) onStderrLine(trimmed);
+        }
+      });
       proc.on('error', (err) => {
         console.warn(`[Recording:${tag}] ffmpeg spawn error did=${safeDid} err=${err?.message || err}`);
       });
       proc.on('exit', (code, signal) => {
-        console.warn(`[Recording:${tag}] ffmpeg exit did=${safeDid} code=${code} signal=${signal}`);
+        const tail = stderrTail.filter((line) => /error|fail|invalid|timed out|refused|401|403|404|hevc|h264/i.test(line));
+        console.warn(
+          `[Recording:${tag}] ffmpeg exit did=${safeDid} code=${code} signal=${signal}` +
+            (tail.length ? `\n  最近错误: ${tail.slice(-4).join(' | ')}` : ''),
+        );
       });
-      if (onStderrLine) {
-        let buf = '';
-        proc.stderr.on('data', (chunk: unknown) => {
-          buf += String(chunk || '');
-          const lines = buf.split(/\r?\n/);
-          buf = lines.pop() ?? '';
-          for (const line of lines) {
-            const trimmed = String(line).trim();
-            if (trimmed) onStderrLine(trimmed);
-          }
-        });
-      }
       proc.stdout.on('data', () => { /* consume */ });
     } catch (err: any) {
       console.warn(`[Recording:${tag}] ffmpeg 启动异常 did=${safeDid} err=${err?.message || err}`);
@@ -1326,6 +1630,10 @@ class SystemService {
     const state = this.cameraArmStates.get(safeDid);
     if (!state) return;
     if (state.pollTimer) clearInterval(state.pollTimer);
+    if (state.personWatcher) {
+      try { state.personWatcher.stop(); } catch { /* noop */ }
+      state.personWatcher = null;
+    }
     // 若有正在录制的事件，先收尾合并，避免停止布防时丢失未完成的片段
     if (state.motionState === 'recording') {
       this.finalizeEvent(safeDid);
@@ -1360,6 +1668,8 @@ class SystemService {
         } catch { /* noop */ }
         return { name: f, size, mtime, url: `${base}/${encodeURIComponent(f)}` };
       })
+      // 过滤掉录制失败留下的空文件/极小文件，避免"回放里点开是空的"造成误解
+      .filter((f) => f.size > 1024)
       .sort((a, b) => b.mtime - a.mtime);
   }
 
@@ -2647,6 +2957,120 @@ class SystemService {
     return { did, category };
   }
 
+  /** 手动添加设备（"添加设备"向导：手动填 IP，或对扫描/探测结果确认添加） */
+  public async upsertManualDevice(
+    input: {
+      name: string;
+      ip: string;
+      mac?: string | null;
+      category: string;
+      vendor?: string | null;
+      model?: string | null;
+      roomId?: string | null;
+    },
+    operatorUserId: string | null,
+    actorContext?: OperationActorContext,
+  ): Promise<{ did: string; name: string; category: string; isNew: boolean }> {
+    const name = String(input.name ?? '').trim();
+    const ip = String(input.ip ?? '').trim();
+    if (!name) throw new AppError(400, 'NAME_REQUIRED', '请填写设备名称');
+    if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)) {
+      throw new AppError(400, 'INVALID_IP', '请填写正确的设备 IP 地址');
+    }
+    const category = String(input.category ?? '').trim();
+    if (!Object.values(DeviceCategory).includes(category as DeviceCategory)) {
+      throw new AppError(400, 'INVALID_CATEGORY', '无效的设备分类');
+    }
+    const macHex = String(input.mac ?? '').replace(/[^0-9A-Fa-f]/g, '').toUpperCase();
+    const didGuess = macHex.length === 12 ? `LAN_${macHex}` : `LAN_IP_${ip.replace(/\./g, '_')}`;
+    const existing = await prisma.device.findFirst({
+      where: { OR: [{ did: didGuess }, { localip: ip }] },
+      orderBy: { createdAt: 'asc' },
+    });
+    const did = existing?.did ?? didGuess;
+
+    let siteId = existing?.siteId ?? null;
+    if (!siteId && input.roomId) {
+      siteId = (await prisma.room.findUnique({ where: { id: input.roomId }, select: { siteId: true } }))?.siteId ?? null;
+    }
+    if (!siteId) {
+      siteId =
+        (await prisma.site.findFirst({
+          where: { isPrimary: true },
+          select: { id: true },
+          orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+        }))?.id ??
+        (await prisma.site.findFirst({ select: { id: true }, orderBy: { createdAt: 'asc' } }))?.id ??
+        null;
+    }
+    if (!siteId) throw new AppError(400, 'NO_SITE', '系统中尚未配置默认区域，无法添加设备');
+
+    let parsed: Record<string, unknown> = {};
+    try {
+      const obj = existing?.model ? JSON.parse(existing.model) : {};
+      if (obj && typeof obj === 'object') parsed = obj as Record<string, unknown>;
+    } catch {
+      parsed = {};
+    }
+    const nextModel = this.safeStringifyModel({
+      ...parsed,
+      ownership: 'other',
+      source: 'manual_add',
+      manualCategory: category,
+      ipAddress: ip,
+      vendorName: input.vendor ? String(input.vendor).trim() : (typeof parsed.vendorName === 'string' ? parsed.vendorName : null),
+      model: input.model ? String(input.model).trim() : (typeof parsed.model === 'string' ? parsed.model : null),
+      _raw: name,
+    });
+
+    const saved = existing
+      ? await prisma.device.update({
+          where: { did },
+          data: {
+            name,
+            model: nextModel,
+            localip: ip,
+            siteId,
+            roomId: input.roomId !== undefined ? input.roomId : existing.roomId,
+            status: PrismaDeviceStatus.online,
+            lastSyncAt: new Date(),
+            offlineSince: null,
+          },
+          select: { did: true, name: true },
+        })
+      : await prisma.device.create({
+          data: {
+            did,
+            siteId,
+            name,
+            model: nextModel,
+            localip: ip,
+            roomId: input.roomId ?? null,
+            status: PrismaDeviceStatus.online,
+            lastSyncAt: new Date(),
+          },
+          select: { did: true, name: true },
+        });
+
+    await writeOperation(
+      operatorUserId,
+      OperationType.update_settings,
+      input.roomId ?? null,
+      {
+        action: existing ? 'update_manual_device' : 'create_manual_device',
+        actionLabel: existing ? '更新手动添加的设备' : '手动添加设备',
+        source: actorContext?.source,
+        sourceLabel: actorContext?.sourceLabel,
+        did,
+        deviceName: saved.name,
+        note: `分类=${category} IP=${ip}`,
+      },
+      true,
+    ).catch(() => {});
+    await broadcastDashboard().catch(() => {});
+    return { did, name: saved.name, category, isNew: !existing };
+  }
+
   public async deleteDevice(
     did: string,
     operatorUserId: string | null,
@@ -2717,45 +3141,7 @@ class SystemService {
     // 优先用 ffmpeg 从 RTSP 流抓真实帧：米家 start-rtsp-stream 返回的快照 URL 可能是
     // 设备 logo/占位图而非实时画面，直接抓取会导致前端显示米家 logo。
     if (rtspUrl) {
-      const frame = await new Promise<Buffer | null>((resolve) => {
-        let timer: ReturnType<typeof setTimeout> | null = null;
-        let proc: ReturnType<typeof spawn> | null = null;
-        const chunks: Buffer[] = [];
-        let settled = false;
-        const finish = (buf: Buffer | null) => {
-          if (settled) return;
-          settled = true;
-          if (timer) clearTimeout(timer);
-          resolve(buf);
-        };
-        timer = setTimeout(() => {
-          try { proc?.kill('SIGKILL'); } catch { /* noop */ }
-          finish(null);
-        }, 15000);
-        try {
-          proc = spawn('ffmpeg', [
-            ...this.buildInputArgs(rtspUrl),
-            '-frames:v', '1',
-            '-f', 'image2pipe',
-            '-vcodec', 'mjpeg',
-            '-q:v', '2',
-            'pipe:1',
-          ], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-        } catch (err: any) {
-          console.warn('[CameraSnapshot] ffmpeg spawn failed did=', did, 'err=', err?.message || err);
-          finish(null);
-          return;
-        }
-        proc.stdout?.on('data', (chunk: unknown) => {
-          chunks.push(Buffer.from(chunk as any));
-        });
-        proc.stderr?.on('data', () => { /* consume */ });
-        proc.on('error', () => finish(null));
-        proc.on('exit', () => {
-          const buf = Buffer.concat(chunks);
-          finish(buf.length > 0 ? buf : null);
-        });
-      });
+      const frame = await this.grabFfmpegFrame(rtspUrl);
       if (frame) return frame;
     }
 
@@ -2779,6 +3165,64 @@ class SystemService {
     return null;
   }
 
+  /** 用 ffmpeg 从任意 RTSP/HTTP 流抓一帧 JPEG（米家摄像头 / 局域网 ONVIF 摄像头快照共用） */
+  private async grabFfmpegFrame(inputUrl: string, timeoutMs = 15000): Promise<Buffer | null> {
+    if (!inputUrl) return null;
+    return new Promise<Buffer | null>((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      let proc: ReturnType<typeof spawn> | null = null;
+      const chunks: Buffer[] = [];
+      let settled = false;
+      const finish = (buf: Buffer | null) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        resolve(buf);
+      };
+      timer = setTimeout(() => {
+        try {
+          proc?.kill('SIGKILL');
+        } catch {
+          /* noop */
+        }
+        finish(null);
+      }, Math.max(2000, timeoutMs));
+      try {
+        proc = spawn(
+          'ffmpeg',
+          [
+            ...this.buildInputArgs(inputUrl),
+            '-frames:v',
+            '1',
+            '-f',
+            'image2pipe',
+            '-vcodec',
+            'mjpeg',
+            '-q:v',
+            '2',
+            'pipe:1',
+          ],
+          { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
+        );
+      } catch (err: any) {
+        console.warn('[CameraSnapshot] ffmpeg spawn failed err=', err?.message || err);
+        finish(null);
+        return;
+      }
+      proc.stdout?.on('data', (chunk: unknown) => {
+        chunks.push(Buffer.from(chunk as any));
+      });
+      proc.stderr?.on('data', () => {
+        /* consume */
+      });
+      proc.on('error', () => finish(null));
+      proc.on('exit', () => {
+        const buf = Buffer.concat(chunks);
+        finish(buf.length > 0 ? buf : null);
+      });
+    });
+  }
+
   public async getDeviceSnapshot(did: string): Promise<{
     contentType: string;
     buffer: Buffer;
@@ -2796,6 +3240,28 @@ class SystemService {
       if (obj && typeof obj === 'object') parsed = obj;
     } catch {
       parsed = null;
+    }
+    // 局域网（ONVIF/RTSP）摄像头：直接用 ffmpeg 从 RTSP 抓真实画面（优先子码流，更快）
+    const lanCameraConfig = (() => {
+      const cam = parsed && parsed.camera && typeof parsed.camera === 'object' ? (parsed.camera as Record<string, unknown>) : null;
+      const lan = cam && cam.lan && typeof cam.lan === 'object' ? (cam.lan as Record<string, unknown>) : null;
+      if (!lan) return null;
+      const rtsp = typeof lan.rtspUrl === 'string' ? lan.rtspUrl.trim() : '';
+      if (!rtsp) return null;
+      const sub = typeof lan.subRtspUrl === 'string' ? lan.subRtspUrl.trim() : '';
+      const preferSub = lan.preferSubStream !== false;
+      return { rtspUrl: preferSub && sub ? sub : rtsp };
+    })();
+    if (lanCameraConfig) {
+      const lanFrame = await this.grabFfmpegFrame(lanCameraConfig.rtspUrl);
+      if (lanFrame) {
+        return {
+          contentType: 'image/jpeg',
+          buffer: lanFrame,
+          tried: ['lan-rtsp-frame'],
+          lastErrorMessage: null,
+        };
+      }
     }
     // 米家云摄像头：走 RTSP 抓帧生成快照，避免用无效的 ONVIF/ISAPI HTTP 地址
     const isXiaomiCamera =
@@ -3608,7 +4074,10 @@ class SystemService {
     };
   }
 
-  public async refreshDashboardNetworkRuntimes(maxAgeMs = 15_000): Promise<number> {
+  /** Nokia 主路由/放大器轮询失败后的冷却截止时间，避免把它弱小的网页服务打挂（503） */
+  private networkRuntimeCooldownUntil = new Map<string, number>();
+
+  public async refreshDashboardNetworkRuntimes(maxAgeMs = 60 * 60_000): Promise<number> {
     const devices = await prisma.device.findMany({
       where: {
         did: { startsWith: 'LAN_' },
@@ -3633,12 +4102,24 @@ class SystemService {
       if (kind !== SystemService.ADAPTER_KIND_HUAWEI_CPE && kind !== SystemService.ADAPTER_KIND_NOKIA_BEACON) {
         continue;
       }
+      // 用户要求：Nokia 放大器/Beacon 后台太弱，识别到之后不再自动轮询，只看最后一次状态
+      if (kind === SystemService.ADAPTER_KIND_NOKIA_BEACON) {
+        continue;
+      }
       const lastSyncTs = device.lastSyncAt ? new Date(device.lastSyncAt).getTime() : 0;
       if (lastSyncTs > 0 && (Date.now() - lastSyncTs) < maxAgeMs) {
         continue;
       }
+      const cooldownUntil = this.networkRuntimeCooldownUntil.get(device.did) ?? 0;
+      if (Date.now() < cooldownUntil) continue;
       const result = await this.refreshDeviceRuntime(device.did, null, undefined, { silent: true }).catch(() => null);
-      if (result?.ok) refreshed += 1;
+      if (result?.ok) {
+        this.networkRuntimeCooldownUntil.delete(device.did);
+        refreshed += 1;
+      } else {
+        // 设备网页过载/超时：5 分钟内不再轮询，避免持续 503
+        this.networkRuntimeCooldownUntil.set(device.did, Date.now() + 5 * 60_000);
+      }
     }
     return refreshed;
   }
