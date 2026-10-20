@@ -88,7 +88,7 @@ async function main() {
     },
   });
 
-  const bossPassword = await bcrypt.hash('boss123', 10);
+  const bossPassword = await bcrypt.hash(process.env.SEED_BOSS_PASSWORD || 'change_me_password', 10);
   await prisma.user.upsert({
     where: { username: 'boss' },
     update: {},
@@ -156,7 +156,7 @@ async function main() {
   console.log('Database seeded successfully!');
   console.log('Default accounts:');
   console.log('  admin / admin123 (管理员)');
-  console.log('  boss / boss123 (老板)');
+  console.log('  boss / (SEED_BOSS_PASSWORD 环境变量)');
   console.log('  user / user123 (普通用户)');
 }
 
