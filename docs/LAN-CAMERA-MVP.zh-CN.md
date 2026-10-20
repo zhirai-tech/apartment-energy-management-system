@@ -249,7 +249,7 @@ cd client; npm run build
 # 本地隔离联调（示例，需要 Django... 不，需要本地 PostgreSQL/Redis）
 # 1) 建测试库并迁移
 docker exec zaem-postgres psql -U zaem -d zaem_db -c "CREATE DATABASE zaem_devtest"
-$env:DATABASE_URL='postgresql://zaem:zaem_password@localhost:5433/zaem_devtest?schema=public'
+$env:DATABASE_URL='postgresql://zaem:change_me_password@localhost:5433/zaem_devtest?schema=public'
 cd server; npx prisma migrate deploy; npx ts-node prisma/seed.ts
 # 2) 启动后端（PORT=3005，关闭小米云凭据，避免误用真实账号）
 $env:XIAOMI_USERNAME=''; $env:XIAOMI_PASSWORD=''; $env:PORT='3005'
