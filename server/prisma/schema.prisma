@@ -175,11 +175,6 @@ model Device {
   voltageV   Float?
   totalKwh   Float?
   lastSyncAt DateTime?
-  offlineSince DateTime?
-  localip    String?
-  controlProtocol String?
-  controlConfig   Json?
-  controlUpdatedAt DateTime?
   createdAt  DateTime     @default(now())
   updatedAt  DateTime     @updatedAt
   dailyNetworkTraffic DailyNetworkTraffic[]

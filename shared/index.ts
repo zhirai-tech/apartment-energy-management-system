@@ -63,7 +63,7 @@ export const DEVICE_CATEGORY_LABEL: Record<DeviceCategory, string> = {
   [DeviceCategory.WIFI_AP]: 'Wi-Fi 网络',
   [DeviceCategory.SMART_APPLIANCE]: '智能家电',
   [DeviceCategory.FIVE_G_CPE]: '5G 路由器',
-  [DeviceCategory.OTHER]: '未分类设备',
+  [DeviceCategory.OTHER]: '其他智能设备',
 } as const;
 
 export function inferDeviceCategory(input: {
@@ -1178,9 +1178,6 @@ export interface CameraRuntime {
   model?: string | null;
   hasAudio?: boolean;
   hasNightVision?: boolean;
-  hasMotion?: boolean;
-  hasRecording?: boolean;
-  hasPTZ?: boolean;
   lastMotionAt?: string | null;
 }
 

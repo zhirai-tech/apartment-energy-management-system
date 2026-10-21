@@ -1,5 +1,5 @@
 import type { ElementType, ReactNode } from 'react';
-import { Zap, DollarSign, Cpu, AlertTriangle, Wifi, WifiOff, TrendingUp } from 'lucide-react';
+import { Zap, DollarSign, Cpu, AlertTriangle, Wifi, WifiOff } from 'lucide-react';
 import { Card, CardContent } from '../ui/card';
 import { Badge } from '../ui/badge';
 import type { DashboardSummary } from '../../types';
@@ -54,12 +54,12 @@ export function StatsCards({ summary, pricePerKwh }: StatsCardsProps) {
     (sum, device) => sum + (device.totalKwh ?? 0),
     0,
   );
-  // 累计电量 = 所有设备累计电量之和（来自设备实际累计读数）
-  const cumulativeEnergy = totalCumulativeKwh;
-  // 今日用电单独展示，不再与累计电量混用同一张卡片，避免“累计数字消失”的误解
-  const todayEnergy = Number(summary.todayTotalUsage ?? 0);
-  const todayCost = Number(summary.estimatedCost ?? 0);
-  const cumulativeCost = totalCumulativeKwh * pricePerKwh;
+  const fallbackEnergy = summary.todayTotalUsage > 0
+    ? summary.todayTotalUsage
+    : totalCumulativeKwh;
+  const fallbackCost = summary.todayTotalUsage > 0
+    ? summary.estimatedCost
+    : totalCumulativeKwh * pricePerKwh;
 
   const publicNetworkDevices = devices.filter((d) =>
     ['wifi_ap', 'five_g_cpe'].includes(String((d as any).category ?? '')),
@@ -110,29 +110,20 @@ export function StatsCards({ summary, pricePerKwh }: StatsCardsProps) {
 
   const stats: StatItem[] = [
     {
-      key: 'cumulative',
-      label: '当前累计电量',
-      value: formatEnergy(cumulativeEnergy),
+      key: 'energy',
+      label: summary.todayTotalUsage > 0 ? '今日总用电' : '当前累计电量',
+      value: formatEnergy(fallbackEnergy),
       icon: Zap,
       iconBg: 'bg-blue-500/10',
       iconColor: 'text-blue-500',
-      badge: { text: `≈${formatCost(cumulativeCost)}`, variant: 'default' },
-    },
-    {
-      key: 'energy',
-      label: '今日总用电',
-      value: formatEnergy(todayEnergy),
-      icon: TrendingUp,
-      iconBg: 'bg-emerald-500/10',
-      iconColor: 'text-emerald-500',
     },
     {
       key: 'cost',
-      label: '今日参考费用',
-      value: formatCost(todayCost),
+      label: summary.todayTotalUsage > 0 ? '今日参考费用' : '累计参考费用',
+      value: formatCost(fallbackCost),
       icon: DollarSign,
-      iconBg: 'bg-teal-500/10',
-      iconColor: 'text-teal-500',
+      iconBg: 'bg-emerald-500/10',
+      iconColor: 'text-emerald-500',
       badge: { text: '参考', variant: 'default' },
     },
     {
@@ -187,7 +178,7 @@ export function StatsCards({ summary, pricePerKwh }: StatsCardsProps) {
   ];
 
   return (
-    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 sm:gap-2.5 lg:grid-cols-6">
+    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 sm:gap-2.5 lg:grid-cols-5">
       {stats.map((stat) => {
         const Icon = stat.icon;
         const card = (

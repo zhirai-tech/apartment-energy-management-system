@@ -1,23 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import {
-  LayoutDashboard,
-  BarChart3,
-  Power,
-  RefreshCw,
-  ShieldAlert,
-  BellRing,
-  ZapOff,
-  X,
-  Plus,
-  PencilLine,
-  Search,
-} from 'lucide-react';
+import { LayoutDashboard, BarChart3, Power, RefreshCw, ShieldAlert, BellRing, ZapOff, X, Plus, PencilLine, Search } from 'lucide-react';
 import { toast } from 'sonner';
 import * as api from '@/lib/api';
 import { getSocket } from '@/lib/socket';
-import { inferEndpointTypeLabel } from '@/lib/format';
 import {
   RoomStatus,
   UserRole,
@@ -32,7 +18,6 @@ import {
 } from '@/types';
 import type { DashboardSummary, AlarmLogResponse, SiteSummary } from '@/types';
 import { StatsCards } from '@/components/dashboard/StatsCards';
-import { RemoteAccessBanner } from '@/components/dashboard/RemoteAccessBanner';
 import { RoomsGrid, type DashboardSpaceCard, floorToDualLabel } from '@/components/dashboard/RoomsGrid';
 import { Separator } from '@/components/ui/separator';
 import { Button } from '@/components/ui/button';
@@ -77,16 +62,41 @@ function normalizeMacKey(value?: string | null): string {
   return String(value ?? '').toUpperCase().replace(/[^A-F0-9]/g, '');
 }
 
+function inferClientEndpointType(input: {
+  name?: string | null;
+  hostname?: string | null;
+  vendor?: string | null;
+  systemCategory?: string | null;
+  interfaceType?: string | null;
+}): string {
+  const category = String(input.systemCategory ?? '').trim();
+  if (category === 'camera') return '摄像头';
+  if (category === 'smart_appliance') return '智能设备';
+  if (category === 'circuit_breaker') return '智能空开';
+  if (category === 'wifi_ap') return '网关';
+  if (category === 'five_g_cpe') return '主路由';
+
+  const text = [
+    input.name ?? '',
+    input.hostname ?? '',
+    input.vendor ?? '',
+    input.interfaceType ?? '',
+  ].join(' ').toLowerCase();
+  if (/(iphone|android|poco|redmi|xiaomi|mi phone|huawei|honor|oppo|vivo|oneplus|realme|galaxy|samsung)/.test(text)) return '手机';
+  if (/(ipad|tablet|tab\b|mi pad|huawei matepad|xiaoxin pad)/.test(text)) return '平板';
+  if (/(macbook|notebook|laptop|desktop|thinkpad|surface|windows|pc\b|lenovo|dell|hp\b|asus|acer|msi)/.test(text)) return '电脑';
+  if (/(amazon|echo|alexa|homepod|google home|nest)/.test(text)) return '音箱';
+  if (/(tv|bravia|hisense|tcl|xiaomi tv|appletv|apple tv|webos)/.test(text)) return '电视';
+  if (/(printer|epson|canon|brother|hp laser|hp ink|打印机)/.test(text)) return '打印机';
+  if (/(switch|breaker|relay|lxzn|miot|tuya|iot|sensor|plug|air purifier|vacuum)/.test(text)) return 'IoT 设备';
+  if (/(beacon|router|mesh|h122|gateway|网关|路由)/.test(text)) return '网络设备';
+  return '未知终端';
+}
+
 function isGenericClientName(value?: string | null): boolean {
   const text = String(value ?? '').trim().toLowerCase();
   if (!text) return true;
   return /^unknown[_-]/.test(text) || /^lan device\b/.test(text) || /^\*no company\*/.test(text);
-}
-
-// 设备级状态 → 卡片级状态：只有明确 online 才显示正常，
-// offline / unknown 一律归为离线，避免「卡片顶部正常、内部离线」的矛盾。
-function roomStatusFromDeviceStatus(status?: string | null): RoomStatus {
-  return status === 'online' ? RoomStatus.NORMAL : RoomStatus.OFFLINE;
 }
 
 function enrichNetworkClients(
@@ -138,7 +148,7 @@ function enrichNetworkClients(
       client?.hostname,
       client?.deviceName,
     ].find((item) => !isGenericClientName(item)) ?? null;
-    const endpointType = inferEndpointTypeLabel({
+    const endpointType = inferClientEndpointType({
       name: matchedTitle ?? rawName,
       hostname: client?.hostname ?? client?.deviceName ?? null,
       vendor: vendorResolved,
@@ -170,8 +180,6 @@ function enrichNetworkClients(
 export function DashboardPage() {
   const DASHBOARD_ALARM_DISPLAY_MS = 12000;
   const queryClient = useQueryClient();
-  const [searchParams] = useSearchParams();
-  const deepLinkCameraDid = searchParams.get('camera');
   const role = useAuthStore((state) => state.role);
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
   const selectedSiteId = useSiteStore((state) => state.selectedSiteId);
@@ -266,7 +274,6 @@ export function DashboardPage() {
     refetchIntervalInBackground: true,
     staleTime: dashboardRefreshInterval,
   });
-
   const { data: unresolvedAlarms } = useQuery<{
     items: AlarmLogResponse[];
     total: number;
@@ -373,6 +380,7 @@ export function DashboardPage() {
     const fallbackManagedDevices = unassigned.filter((device) => {
       const cat = String((device as any).category ?? 'other');
       if (PUBLIC_FACILITY_CATEGORIES.has(cat)) return false;
+      if (cat === 'other') return false;
       return true;
     });
 
@@ -708,7 +716,7 @@ export function DashboardPage() {
           roomNumber: device.roomNumber ?? null,
           roomAnnotation: (device as any).roomAnnotation ?? null,
           floor: 0,
-          status: roomStatusFromDeviceStatus(device.status),
+          status: device.status === 'offline' ? RoomStatus.OFFLINE : RoomStatus.NORMAL,
           power: device.powerW ?? 0,
           todayUsage: (device as any).todayUsageKwh ?? 0,
           monthUsage: 0,
@@ -751,22 +759,7 @@ export function DashboardPage() {
         const idHint = fallbackBits.length > 0
           ? fallbackBits.join(' · ')
           : `DID ${String(device.did).slice(-6)}`;
-        // 优先展示真实名称；名称是通用占位符时，回退到推断的终端类型（手机/电脑/电视等），
-        // 避免未分类设备卡片大面积显示「未知/LAN Device」。
-        const rawName = (any.name ?? device.name ?? '').toString().trim();
-        const endpointType = inferEndpointTypeLabel({
-          name: any.name ?? null,
-          hostname: any.hostname ?? any.hostName ?? null,
-          vendor: any.vendor ?? any.vendorName ?? any.manufacturer ?? any.brand ?? null,
-          systemCategory: any.category ?? null,
-          interfaceType: null,
-        });
-        const title =
-          rawName && !isGenericClientName(rawName)
-            ? rawName
-            : endpointType !== '未知终端'
-              ? endpointType
-              : idHint.slice(0, 16) || '未分类设备';
+        const title = (any.name ?? device.name ?? '').toString().trim() || idHint.slice(0, 16) || '未命名设备';
         return {
           key: device.did,
           title,
@@ -776,7 +769,7 @@ export function DashboardPage() {
           roomNumber: device.roomNumber,
           roomAnnotation: null,
           floor: 1,
-          status: roomStatusFromDeviceStatus(device.status),
+          status: device.status === 'offline' ? RoomStatus.OFFLINE : RoomStatus.NORMAL,
           power: device.powerW ?? 0,
           todayUsage: 0,
           monthUsage: 0,
@@ -840,30 +833,17 @@ export function DashboardPage() {
     const keys = ['circuit_breaker', 'camera', 'wifi_ap', 'five_g_cpe', 'smart_appliance', 'other'];
     return keys.filter((k) => (allCategoryCounts[k] ?? 0) > 0);
   }, [allCategoryCounts]);
-  // 分类页签：分类多于一个时，最前面加一个「全部」（默认仍显示智能空开）
-  const globalCategoryTabs = useMemo<string[]>(
-    () => (presentGlobalCategories.length > 1 ? ['all', ...presentGlobalCategories] : presentGlobalCategories),
-    [presentGlobalCategories],
-  );
   const [activeGlobalCategory, setActiveGlobalCategory] = useState<string>('circuit_breaker');
   const [activeFloorFilter, setActiveFloorFilter] = useState<string>('all');
   useEffect(() => {
     if (!presentGlobalCategories.length) return;
-    if (globalCategoryTabs.includes(activeGlobalCategory)) return;
+    if (presentGlobalCategories.includes(activeGlobalCategory)) return;
     if (presentGlobalCategories.includes('circuit_breaker')) {
       setActiveGlobalCategory('circuit_breaker');
       return;
     }
     setActiveGlobalCategory(presentGlobalCategories[0]);
-  }, [globalCategoryTabs, activeGlobalCategory]);
-
-  // 录像回放页深链：?camera=<did> 时切换到摄像头分类，确保摄像头卡片渲染并自动打开详情
-  useEffect(() => {
-    if (!deepLinkCameraDid) return;
-    if (presentGlobalCategories.includes('camera')) {
-      setActiveGlobalCategory('camera');
-    }
-  }, [deepLinkCameraDid, presentGlobalCategories]);
+  }, [presentGlobalCategories, activeGlobalCategory]);
   const floorLabels = useMemo<Array<{ key: string; label: string; sortValue: number; isPublic?: boolean }>>(() => {
     if (!summary) return [];
     const seen = new Map<string, { key: string; label: string; sortValue: number; isPublic?: boolean }>();
@@ -885,7 +865,7 @@ export function DashboardPage() {
 
   const filteredCards = useMemo<DashboardSpaceCard[]>(() => {
     let arr = displayCards;
-    if (activeGlobalCategory && activeGlobalCategory !== 'all') {
+    if (activeGlobalCategory) {
       arr = arr.filter((card) =>
         (card.devices ?? []).some((d) => String((d as any).category ?? 'other') === activeGlobalCategory),
       );
@@ -905,9 +885,7 @@ export function DashboardPage() {
   const isEmptySelectedSite = !!selectedSite && (selectedSite.deviceCount === 0 || displayCards.length === 0);
   const pricePerKwh = settings?.pricePerKwh ?? 0.6;
   const activeCategoryLabel =
-    activeGlobalCategory === 'all'
-      ? '全部设备'
-      : (DEVICE_CATEGORY_LABEL as Record<string, string>)[activeGlobalCategory] ?? activeGlobalCategory ?? '设备';
+    (DEVICE_CATEGORY_LABEL as Record<string, string>)[activeGlobalCategory] ?? activeGlobalCategory ?? '设备';
   const allDevicesPoweredOn = useMemo(() => {
     const rooms = Array.isArray(summary?.roomData)
       ? summary.roomData.filter((room) => room.devices.length > 0)
@@ -1184,8 +1162,6 @@ export function DashboardPage() {
         ) : null}
       </div>
 
-      <RemoteAccessBanner />
-
       {isLoading ? (
         <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-6">
           {Array.from({ length: 6 }).map((_, i) => (
@@ -1210,12 +1186,12 @@ export function DashboardPage() {
             </span>
           </div>
           <div className="flex flex-wrap items-stretch gap-2">
-            {globalCategoryTabs.length > 0 ? (
+            {presentGlobalCategories.length > 0 ? (
               <Tabs value={activeGlobalCategory} onValueChange={setActiveGlobalCategory} className="w-auto shrink-0">
                 <TabsList className="inline-flex flex-wrap h-9 rounded-lg bg-muted/60 p-1 gap-1">
-                  {globalCategoryTabs.map((cat) => {
-                    const label = cat === 'all' ? '全部' : ((DEVICE_CATEGORY_LABEL as Record<string, string>)[cat] ?? cat);
-                    const count = cat === 'all' ? displayCards.length : (allCategoryCounts[cat] ?? 0);
+                  {presentGlobalCategories.map((cat) => {
+                    const label = ((DEVICE_CATEGORY_LABEL as Record<string, string>)[cat] ?? cat);
+                    const count = allCategoryCounts[cat] ?? 0;
                     return (
                       <TabsTrigger
                         key={cat}

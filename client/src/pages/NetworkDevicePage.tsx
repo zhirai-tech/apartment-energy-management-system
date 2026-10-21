@@ -26,7 +26,7 @@ import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { formatBytes as formatBytesShared, hasMeaningfulValue as hasMeaningfulValueShared, normalizeMac, inferEndpointTypeLabel } from '@/lib/format';
+import { formatBytes as formatBytesShared, hasMeaningfulValue as hasMeaningfulValueShared, normalizeMac } from '@/lib/format';
 
 function normalizeMacKey(value?: string | null): string {
   return normalizeMac(value);
@@ -42,6 +42,37 @@ function hasMeaningfulValue(value: unknown): boolean {
 
 function formatMbps(value: number | null | undefined): string | null {
   return value != null && Number.isFinite(value) && Number(value) > 0 ? `${Number(value).toFixed(1)} Mbps` : null;
+}
+
+function inferClientEndpointType(input: {
+  name?: string | null;
+  hostname?: string | null;
+  vendor?: string | null;
+  systemCategory?: string | null;
+  interfaceType?: string | null;
+}): string {
+  const category = String(input.systemCategory ?? '').trim();
+  if (category === 'camera') return '摄像头';
+  if (category === 'smart_appliance') return '智能设备';
+  if (category === 'circuit_breaker') return '智能空开';
+  if (category === 'wifi_ap') return '网关';
+  if (category === 'five_g_cpe') return '主路由';
+
+  const text = [
+    input.name ?? '',
+    input.hostname ?? '',
+    input.vendor ?? '',
+    input.interfaceType ?? '',
+  ].join(' ').toLowerCase();
+  if (/(iphone|android|poco|redmi|xiaomi|mi phone|huawei|honor|oppo|vivo|oneplus|realme|galaxy|samsung)/.test(text)) return '手机';
+  if (/(ipad|tablet|tab\b|mi pad|matepad|xiaoxin pad)/.test(text)) return '平板';
+  if (/(macbook|notebook|laptop|desktop|thinkpad|surface|windows|pc\b|lenovo|dell|hp\b|asus|acer|msi)/.test(text)) return '电脑';
+  if (/(amazon|echo|alexa|homepod|google home|nest)/.test(text)) return '音箱';
+  if (/(tv|bravia|hisense|tcl|xiaomi tv|appletv|apple tv|webos)/.test(text)) return '电视';
+  if (/(printer|epson|canon|brother|hp laser|打印机)/.test(text)) return '打印机';
+  if (/(switch|breaker|relay|lxzn|miot|tuya|iot|sensor|plug|air purifier|vacuum)/.test(text)) return 'IoT 设备';
+  if (/(beacon|router|mesh|h122|gateway|网关|路由)/.test(text)) return '网络设备';
+  return '未知终端';
 }
 
 function isGenericClientName(value?: string | null): boolean {
@@ -88,7 +119,7 @@ function enrichNetworkClients(clients: any[], allDevices: DeviceItem[]): any[] {
       : null;
     const vendorResolved = client?.vendor ?? matchedVendor ?? null;
     const rawName = [client?.name, client?.hostname, client?.deviceName].find((item) => !isGenericClientName(item)) ?? null;
-    const endpointType = inferEndpointTypeLabel({
+    const endpointType = inferClientEndpointType({
       name: matchedTitle ?? rawName,
       hostname: client?.hostname ?? client?.deviceName ?? null,
       vendor: vendorResolved,

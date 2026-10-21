@@ -23,7 +23,7 @@ export interface XiaomiSession {
 }
 
 export interface XiaomiAuthStatus {
-  state: 'idle' | 'logged_in' | 'challenge_required' | 'error' | 'recovering';
+  state: 'idle' | 'logged_in' | 'challenge_required' | 'error';
   needsVerification: boolean;
   verificationMethod?: 'browser' | 'email_code' | 'mobile_code' | null;
   message?: string;
@@ -118,42 +118,15 @@ export function getDeviceListUrl(region?: string): string {
 }
 
 export function mergeCookieHeader(base: string, append: string | string[] | undefined): string {
-  // 把已有 Cookie 头解析成 name->value 映射（同名后出现者覆盖前者），
-  // 再把新的 Set-Cookie 行解析进来。只取每行第一个 "name=value" 段，
-  // Domain/Path/Max-Age/Expires/HttpOnly/Secure 等属性一律丢弃，
-  // 避免把 `serviceToken=EXPIRED`、`Domain=...` 之类内容混入后续请求的 Cookie 头。
-  const map = parseCookiePairs(base);
-  if (append) {
-    const list = Array.isArray(append) ? append : [append];
-    for (const line of list) {
-      const str = String(line || '').trim();
-      if (!str) continue;
-      const first = str.split(';')[0];
-      const idx = first.indexOf('=');
-      if (idx <= 0) continue;
-      const name = first.slice(0, idx).trim();
-      const value = first.slice(idx + 1).trim();
-      if (!name) continue;
-      map[name] = value;
-    }
+  if (!append) return base;
+  const parts: string[] = [];
+  if (base) parts.push(base);
+  if (Array.isArray(append)) {
+    for (const p of append) if (p) parts.push(p);
+  } else if (typeof append === 'string' && append) {
+    parts.push(append);
   }
-  return cookieMapToHeader(map);
-}
-
-function parseCookiePairs(header: string | undefined): Record<string, string> {
-  const out: Record<string, string> = {};
-  if (!header) return out;
-  for (const part of String(header).split(';')) {
-    const item = part.trim();
-    if (!item) continue;
-    const idx = item.indexOf('=');
-    if (idx <= 0) continue;
-    const name = item.slice(0, idx).trim();
-    const value = item.slice(idx + 1).trim();
-    if (!name) continue;
-    out[name] = value;
-  }
-  return out;
+  return parts.join('; ');
 }
 
 export function setCookieHeaderToMap(input?: string | string[]): Record<string, string> {

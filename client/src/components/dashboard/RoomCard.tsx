@@ -1,5 +1,5 @@
 import { useState, type MouseEvent, useEffect, useMemo, useRef } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { Card, CardContent } from '../ui/card';
@@ -16,10 +16,12 @@ import {
   Download,
   Server,
   Users,
+  Camera as CameraIcon,
   Mic,
   HardDrive,
   BellRing,
   Moon,
+  Settings,
   Wifi as WifiIcon,
   SignalHigh,
   Clock,
@@ -30,9 +32,15 @@ import {
   ChevronDown,
   ChevronRight,
   Image,
-  Settings,
+  HelpCircle,
+  ArrowLeft,
+  X,
+  Eye,
+  EyeOff,
+  MicOff,
+  ShieldAlert,
+  Monitor,
   ExternalLink,
-  WifiOff,
 } from 'lucide-react';
 import {
   ROOM_STATUS_COLORS,
@@ -54,7 +62,6 @@ import {
   formatBytes,
   hasMeaningfulValue,
   progressColorForPercent,
-  inferEndpointTypeLabel,
 } from '../../lib/format';
 import { getRoomStatusCardToneClass } from '../../lib/status-maps';
 import { energy, system } from '../../lib/api';
@@ -74,8 +81,10 @@ import {
   SelectValue,
 } from '../ui/select';
 import { useAuthStore } from '../../store/auth';
+import { useXiaomiRememberedCredentials } from '../../hooks/useXiaomiRememberedCredentials';
 import { DashboardSpaceCard, floorToDualLabel } from './RoomsGrid';
 import { FeeHint } from '../ui/fee-hint';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../ui/tooltip';
 
 interface RoomCardProps {
   room: DashboardSpaceCard;
@@ -94,7 +103,6 @@ function getToggleButtonClass(checked: boolean, disabled?: boolean) {
 
 export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
   const navigate = useNavigate();
-  const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const role = useAuthStore((state) => state.role);
   const canControl = role === UserRole.ADMIN || role === UserRole.BOSS;
@@ -124,34 +132,67 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
   const [savingLimit, setSavingLimit] = useState(false);
   const [limitTogglePending, setLimitTogglePending] = useState(false);
   const [costLimitTogglePending, setCostLimitTogglePending] = useState(false);
+  const [cameraDetailOpen, setCameraDetailOpen] = useState(false);
   const [cameraSnapshotBump, setCameraSnapshotBump] = useState(0);
   const snapshotThumbReloadRef = useRef<number>(0);
+  const [camManualSnapshotUrl, setCamManualSnapshotUrl] = useState('');
+  const [camManualAuthUsername, setCamManualAuthUsername] = useState('');
+  const [camManualAuthPassword, setCamManualAuthPassword] = useState('');
+  const [camManualAuthType, setCamManualAuthType] = useState<'digest' | 'basic' | 'none'>('digest');
+  const [camManualBrand, setCamManualBrand] = useState('');
+  const [camManualModel, setCamManualModel] = useState('');
+  const [savingCameraManual, setSavingCameraManual] = useState(false);
+  const [cameraManualExpanded, setCameraManualExpanded] = useState(false);
+  const [cameraViewTab, setCameraViewTab] = useState<'live' | 'settings'>('live');
+  const [helpModalTopic, setHelpModalTopic] = useState<'eu' | 'lan' | null>(null);
+  const [streamQuality, setStreamQuality] = useState<'hd' | 'sd'>('hd');
+  const [camSwitches, setCamSwitches] = useState<{
+    motion: boolean; night: boolean; audio: boolean; privacy: boolean;
+  }>({ motion: false, night: false, audio: false, privacy: false });
   const [takeSnapshotLoading, setTakeSnapshotLoading] = useState(false);
-  // 局域网设备控制配置（HTTP / Modbus / Tuya / MiIO）
-  const [controlProtocol, setControlProtocol] = useState('');
-  const [controlLocalIp, setControlLocalIp] = useState('');
-  const [httpOnUrl, setHttpOnUrl] = useState('');
-  const [httpOffUrl, setHttpOffUrl] = useState('');
-  const [httpStateUrl, setHttpStateUrl] = useState('');
-  const [modbusPort, setModbusPort] = useState('502');
-  const [modbusUnitId, setModbusUnitId] = useState('1');
-  const [modbusCoilAddr, setModbusCoilAddr] = useState('0');
-  const [controlSaving, setControlSaving] = useState(false);
-  const [controlTesting, setControlTesting] = useState(false);
-  const [controlTestResult, setControlTestResult] = useState('');
-  const cardVideoRef = useRef<HTMLVideoElement | null>(null);
-  const cardHlsInstanceRef = useRef<any>(null);
-  const [cardStream, setCardStream] = useState<{ hlsUrl?: string } | null>(null);
-  const cardReconnectAttemptRef = useRef(0);
-  const [cardStreamEpoch, setCardStreamEpoch] = useState(0);
+  const [openStreamLoading, setOpenStreamLoading] = useState(false);
+  const [startStreamError, setStartStreamError] = useState<string>('');
+  const [currentStream, setCurrentStream] = useState<{
+    hlsUrl?: string;
+    webrtcUrl?: string;
+    proxyMode?: string;
+    processId?: number;
+    startedAt?: string;
+    ffmpegAvailable?: boolean;
+  } | null>(null);
+  const hlsVideoRef = useRef<HTMLVideoElement | null>(null);
+  const hlsInstanceRef = useRef<any>(null);
+  const [ptzLoading, setPtzLoading] = useState(false);
+  const [euCameraLoginExpanded, setEuCameraLoginExpanded] = useState(false);
+  const { credentials: euCameraRemember, persist: persistEuCameraRemember, clear: clearEuCameraRemember } =
+    useXiaomiRememberedCredentials('camera')
+  void clearEuCameraRemember;
+  const [euCameraUsername, setEuCameraUsername] = useState(euCameraRemember.username);
+  const [euCameraPassword, setEuCameraPassword] = useState(euCameraRemember.password);
+  const [euCameraRegion, setEuCameraRegion] = useState<string>(euCameraRemember.region || 'de');
+  useEffect(() => {
+    setEuCameraUsername(euCameraRemember.username);
+    setEuCameraPassword(euCameraRemember.password);
+    setEuCameraRegion(euCameraRemember.region || 'de');
+  }, [euCameraRemember.username, euCameraRemember.password, euCameraRemember.region]);
+  const [euCameraLoginLoading, setEuCameraLoginLoading] = useState(false);
+  void euCameraLoginLoading;
+  const [euCameraLoginInfo, setEuCameraLoginInfo] = useState<{
+    loggedIn: boolean;
+    username?: string;
+    region?: string;
+    devices?: any[];
+    needsVerification?: boolean | null;
+    verificationMethod?: 'email_code' | 'browser' | null;
+    notificationUrl?: string | null;
+    authMessage?: string | null;
+    codeSentAt?: string | null;
+  } | null>(null);
+  const [euCameraVerificationCode, setEuCameraVerificationCode] = useState('');
+  const [euCameraOtpLoading, setEuCameraOtpLoading] = useState<null | 'send' | 'verify'>(null);
+  void euCameraOtpLoading;
+  const [otpResendCountdown, setOtpResendCountdown] = useState<number>(0);
   const [networkDetailOpen, setNetworkDetailOpen] = useState(false);
-  const [deviceDetailOpen, setDeviceDetailOpen] = useState(false);
-  const [deviceCategoryDraft, setDeviceCategoryDraft] = useState<string>('');
-  const [deviceCategorySaving, setDeviceCategorySaving] = useState(false);
-  const [deviceNameDraft, setDeviceNameDraft] = useState('');
-  const [deviceNameSaving, setDeviceNameSaving] = useState(false);
-  const [deviceDeleting, setDeviceDeleting] = useState(false);
-  const [deviceDeleteConfirming, setDeviceDeleteConfirming] = useState(false);
   const [adapterKind, setAdapterKind] = useState<'huawei_cpe' | 'nokia_beacon' | null>(null);
   const [adapterBaseUrl, setAdapterBaseUrl] = useState('');
   const [adapterUsername, setAdapterUsername] = useState('admin');
@@ -275,7 +316,59 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
     }
   };
 
+  useEffect(() => {
+    if (!cameraDetailOpen) return;
+    const raw = firstDevice?.model ?? '';
+    let obj: any = null;
+    try {
+      if (raw && typeof raw === 'string') obj = JSON.parse(raw);
+    } catch {
+      obj = null;
+    }
+    if (obj && typeof obj === 'object') {
+      const cam = (obj as any).camera && typeof (obj as any).camera === 'object' ? (obj as any).camera : null;
+      setCamManualSnapshotUrl(String(cam?.manualSnapshotUrl ?? obj?.manualSnapshotUrl ?? ''));
+      setCamManualAuthUsername(String(cam?.manualAuthUsername ?? obj?.manualAuthUsername ?? ''));
+      setCamManualAuthPassword(String(cam?.manualAuthPassword ?? obj?.manualAuthPassword ?? ''));
+      const at = String(cam?.manualAuthType ?? obj?.manualAuthType ?? 'digest').toLowerCase();
+      setCamManualAuthType(at === 'basic' ? 'basic' : at === 'none' ? 'none' : 'digest');
+      setCamManualBrand(String(cam?.manualBrand ?? cam?.brand ?? obj?.vendorName ?? ''));
+      setCamManualModel(String(cam?.manualModel ?? cam?.model ?? obj?.model ?? ''));
+    } else {
+      setCamManualSnapshotUrl('');
+      setCamManualAuthUsername('');
+      setCamManualAuthPassword('');
+      setCamManualAuthType('digest');
+      setCamManualBrand(String(firstDevice?.vendorName ?? ''));
+      setCamManualModel(String(firstDevice?.camera?.model ?? firstDevice?.model ?? ''));
+    }
+  }, [cameraDetailOpen, firstDevice]);
 
+  const handleSaveCameraManual = async () => {
+    if (!deviceDid) {
+      toast.error('设备 DID 不存在');
+      return;
+    }
+    try {
+      setSavingCameraManual(true);
+      await system.updateDeviceCamera(deviceDid, {
+        manualSnapshotUrl: camManualSnapshotUrl || null,
+        manualAuthUsername: camManualAuthUsername || null,
+        manualAuthPassword: camManualAuthPassword || null,
+        manualAuthType: camManualAuthType,
+        manualBrand: camManualBrand || null,
+        manualModel: camManualModel || null,
+      });
+      await queryClient.invalidateQueries({ queryKey: ['dashboard'] });
+      setCameraSnapshotBump((prev) => prev + 1);
+      snapshotThumbReloadRef.current += 1;
+      toast.success('摄像头快照配置已保存');
+    } catch {
+      toast.error('保存摄像头快照配置失败');
+    } finally {
+      setSavingCameraManual(false);
+    }
+  };
 
   const statusColor = ROOM_STATUS_COLORS[room.status];
   const statusText = ROOM_STATUS_TEXT[room.status];
@@ -304,180 +397,12 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
   const primaryCategoryLabel = DEVICE_CATEGORY_LABEL[primaryCategory] ?? '其他智能设备';
   const multiCategory = Object.values(categoryCounts).filter((n) => n > 0).length >= 2;
 
-  // 录像回放页快捷入口：通过 ?camera=<did> 深链直接打开摄像头详情
-  const deepLinkCameraDid = searchParams.get('camera');
-  useEffect(() => {
-    if (
-      deepLinkCameraDid &&
-      primaryCategory === DeviceCategory.CAMERA &&
-      deviceDid === deepLinkCameraDid
-    ) {
-      navigate('/cameras');
-      const next = new URLSearchParams(searchParams);
-      next.delete('camera');
-      setSearchParams(next, { replace: true });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [deepLinkCameraDid, primaryCategory, deviceDid]);
-
   const cardToneClassName = getRoomStatusCardToneClass(room.status);
-
-  const openDeviceDetail = async () => {
-    if (!deviceDid) {
-      toast.warning('设备信息不存在');
-      return;
-    }
-    setDeviceCategoryDraft(String((firstDevice as any)?.category ?? primaryCategory ?? 'other'));
-    setDeviceNameDraft(String(room.title ?? (firstDevice as any)?.name ?? ''));
-    setDeviceDeleteConfirming(false);
-    // 加载局域网控制配置
-    setControlProtocol('');
-    setControlLocalIp('');
-    setHttpOnUrl('');
-    setHttpOffUrl('');
-    setHttpStateUrl('');
-    setModbusPort('502');
-    setModbusUnitId('1');
-    setModbusCoilAddr('0');
-    setControlTestResult('');
-    try {
-      const cfg = await system.getDeviceControlConfig(deviceDid);
-      if (cfg.controlProtocol) setControlProtocol(cfg.controlProtocol);
-      if (cfg.localip) setControlLocalIp(cfg.localip);
-      const c = (cfg.controlConfig ?? {}) as any;
-      setHttpOnUrl(c.onUrl ?? '');
-      setHttpOffUrl(c.offUrl ?? '');
-      setHttpStateUrl(c.stateUrl ?? '');
-      if (c.modbusPort != null) setModbusPort(String(c.modbusPort));
-      if (c.modbusUnitId != null) setModbusUnitId(String(c.modbusUnitId));
-      if (c.coilAddress != null) setModbusCoilAddr(String(c.coilAddress));
-    } catch {
-      // 未配置或非局域网设备，保持默认空值
-    }
-    setDeviceDetailOpen(true);
-  };
-
-  const buildControlConfig = () => {
-    const base: Record<string, unknown> = {};
-    if (controlProtocol === 'http') {
-      base.onUrl = httpOnUrl.trim();
-      base.offUrl = httpOffUrl.trim();
-      base.stateUrl = httpStateUrl.trim();
-    } else if (controlProtocol === 'modbus_tcp') {
-      base.modbusPort = Number(modbusPort) || 502;
-      base.modbusUnitId = Number(modbusUnitId) || 1;
-      base.coilAddress = Number(modbusCoilAddr) || 0;
-    }
-    return base;
-  };
-
-  const handleSaveControlConfig = async () => {
-    if (!deviceDid) return;
-    try {
-      setControlSaving(true);
-      await system.updateDeviceControlConfig(deviceDid, {
-        localip: controlLocalIp.trim(),
-        controlProtocol: controlProtocol || null,
-        controlConfig: controlProtocol ? buildControlConfig() : null,
-      });
-      await queryClient.invalidateQueries({ queryKey: ['dashboard'] });
-      toast.success('局域网控制配置已保存');
-    } catch (e: any) {
-      toast.error(e?.response?.data?.message || e?.message || '保存失败');
-    } finally {
-      setControlSaving(false);
-    }
-  };
-
-  const handleTestControl = async (action?: 'on' | 'off') => {
-    if (!deviceDid) return;
-    try {
-      setControlTesting(true);
-      setControlTestResult('');
-      const res = await system.testDeviceControlConfig(deviceDid, {
-        localip: controlLocalIp.trim(),
-        controlProtocol: controlProtocol || undefined,
-        controlConfig: controlProtocol ? buildControlConfig() : undefined,
-        action,
-      });
-      if (action) {
-        setControlTestResult(res.ok ? `测试成功（${action === 'on' ? '开' : '关'}）` : '测试失败');
-      } else {
-        setControlTestResult(
-          res.state?.reachable
-            ? `状态读取成功：${res.state.on === true ? '开' : res.state.on === false ? '关' : '未知'}${res.state.powerW != null ? `，功率 ${res.state.powerW}W` : ''}`
-            : `状态读取失败：${res.state?.error || '设备不可达'}`,
-        );
-      }
-    } catch (e: any) {
-      setControlTestResult(e?.response?.data?.message || e?.message || '测试失败');
-    } finally {
-      setControlTesting(false);
-    }
-  };
-
-  const handleSaveDeviceCategory = async () => {
-    if (!deviceDid || !canControl) return;
-    if (!Object.values(DeviceCategory).includes(deviceCategoryDraft as DeviceCategory)) {
-      toast.error('无效的设备分类');
-      return;
-    }
-    try {
-      setDeviceCategorySaving(true);
-      await system.updateDeviceCategory(deviceDid, deviceCategoryDraft);
-      await queryClient.invalidateQueries({ queryKey: ['dashboard'] });
-      setDeviceDetailOpen(false);
-      toast.success('设备分类已更新');
-    } catch (error: any) {
-      toast.error(error?.response?.data?.message || error?.message || '更新设备分类失败');
-    } finally {
-      setDeviceCategorySaving(false);
-    }
-  };
-
-  const handleSaveDeviceName = async () => {
-    if (!deviceDid || !canRename) return;
-    const trimmed = (deviceNameDraft ?? '').trim();
-    if (!trimmed) {
-      toast.error('设备名称不能为空');
-      return;
-    }
-    try {
-      setDeviceNameSaving(true);
-      await system.renameDevice(deviceDid, trimmed);
-      await queryClient.invalidateQueries({ queryKey: ['dashboard'] });
-      toast.success('设备名称已更新');
-    } catch {
-      toast.error('修改设备名称失败');
-    } finally {
-      setDeviceNameSaving(false);
-    }
-  };
-
-  const handleDeleteDevice = async () => {
-    if (!deviceDid || !canControl) return;
-    if (!deviceDeleteConfirming) {
-      setDeviceDeleteConfirming(true);
-      return;
-    }
-    try {
-      setDeviceDeleting(true);
-      await system.deleteDevice(deviceDid);
-      await queryClient.invalidateQueries({ queryKey: ['dashboard'] });
-      setDeviceDetailOpen(false);
-      setDeviceDeleteConfirming(false);
-      toast.success('设备已删除');
-    } catch (error: any) {
-      toast.error(error?.response?.data?.message || error?.message || '删除设备失败');
-    } finally {
-      setDeviceDeleting(false);
-    }
-  };
 
   const handleOpenDetail = () => {
     if (editingName) return;
     if (primaryCategory === DeviceCategory.CAMERA) {
-      navigate('/cameras');
+      setCameraDetailOpen(true);
       return;
     }
     if (primaryCategory === DeviceCategory.WIFI_AP || primaryCategory === DeviceCategory.FIVE_G_CPE) {
@@ -486,15 +411,17 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
     }
     if (room.roomId) {
       navigate(`/rooms/${room.roomId}`);
-      return;
     }
-    openDeviceDetail();
   };
 
   const cameraSnapshotThumbUrl = useMemo(() => {
     if (primaryCategory !== DeviceCategory.CAMERA || !deviceDid) return '';
     return system.getDeviceSnapshotUrl(deviceDid, { fresh: false });
   }, [primaryCategory, deviceDid, cameraSnapshotBump]);
+  const cameraSnapshotLargeUrl = useMemo(() => {
+    if (primaryCategory !== DeviceCategory.CAMERA || !deviceDid) return '';
+    return system.getDeviceSnapshotUrl(deviceDid, { fresh: true });
+  }, [primaryCategory, deviceDid, cameraSnapshotBump, cameraDetailOpen]);
 
   useEffect(() => {
     if (primaryCategory !== DeviceCategory.CAMERA) return;
@@ -511,157 +438,6 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
       clearTimeout(timer);
     };
   }, [primaryCategory, deviceDid]);
-
-  // 卡片主画面：自动拉取 HLS 真实视频流（米家摄像头走云端 m3u8，绕开 logo 快照问题）
-  useEffect(() => {
-    if (primaryCategory !== DeviceCategory.CAMERA || !deviceDid) {
-      setCardStream(null);
-      return;
-    }
-    let cancelled = false;
-    let retryTimer: ReturnType<typeof setTimeout> | null = null;
-    const tryFetch = async () => {
-      try {
-        // 复用服务端现有代理/缓存会话：绝不强制换新云端会话，
-        // 避免高频 startHLSStream 触发小米云端限流（会返回全部无效 URL）。
-        const res = await system.getCameraStream(deviceDid);
-        if (cancelled) return;
-        // 只有后端确认实时流就绪（hlsReady=true）才播流，否则保持快照兜底
-        if (res.hlsUrl && res.hlsReady === true) {
-          setCardStream({ hlsUrl: res.hlsUrl });
-          return;
-        }
-        // 拉流未就绪（代理冷却/重建中）：周期重试，等待后端云端会话自愈后再播流
-        setCardStream(null);
-        retryTimer = setTimeout(tryFetch, 10_000);
-      } catch {
-        // 拉流失败时保持快照兜底，不打断渲染；稍后自动重试
-        if (!cancelled) {
-          setCardStream(null);
-          retryTimer = setTimeout(tryFetch, 10_000);
-        }
-      }
-    };
-    tryFetch();
-    return () => {
-      cancelled = true;
-      if (retryTimer) clearTimeout(retryTimer);
-    };
-  }, [primaryCategory, deviceDid, cardStreamEpoch]);
-
-  useEffect(() => {
-    const url = cardStream?.hlsUrl;
-    const videoEl = cardVideoRef.current;
-    if (!url || !videoEl) return;
-    let destroyed = false;
-    let stallTimer: ReturnType<typeof setTimeout> | null = null;
-    const triggerCardReconnect = () => {
-      if (stallTimer) return;
-      if (cardReconnectAttemptRef.current >= 12) return;
-      cardReconnectAttemptRef.current += 1;
-      stallTimer = setTimeout(() => {
-        stallTimer = null;
-        setCardStreamEpoch((e) => e + 1);
-      }, 2500);
-    };
-    const onVideoError = () => triggerCardReconnect();
-    // 短时网络抖动交给 hls.js 重试，仅当持续 8s 无数据才重连
-    let stallSince = 0;
-    const onStalled = () => {
-      if (videoEl.readyState >= 2) return;
-      const now = Date.now();
-      if (!stallSince) stallSince = now;
-      else if (now - stallSince > 8000) {
-        stallSince = 0;
-        triggerCardReconnect();
-      }
-    };
-    const onPlaying = () => {
-      stallSince = 0;
-    };
-    videoEl.addEventListener('error', onVideoError);
-    videoEl.addEventListener('stalled', onStalled);
-    videoEl.addEventListener('playing', onPlaying);
-    const run = async () => {
-      const canNative =
-        typeof videoEl.canPlayType === 'function' &&
-        videoEl.canPlayType('application/vnd.apple.mpegurl');
-      // 优先 hls.js（MSE）：桌面 Chrome 原生 HLS 解码 MPEG-TS 常报 DEMUXER_ERROR 黑屏，
-      // 仅当浏览器不支持 MSE 时才退回原生 HLS（iOS Safari）。
-      let Hls: any = null;
-      try {
-        Hls = (await import('hls.js')).default;
-      } catch {
-        Hls = null;
-      }
-      const hlsSupported = !!(Hls && typeof Hls.isSupported === 'function' && Hls.isSupported());
-      if (!hlsSupported) {
-        if (canNative) {
-          videoEl.src = url;
-          try { await videoEl.play(); } catch {}
-        }
-        return;
-      }
-      try {
-        if (!Hls || !hlsSupported) return;
-        const hls = new Hls({
-          lowLatencyMode: false,
-          enableWorker: true,
-          liveSyncDurationCount: 3,
-          liveMaxLatencyDurationCount: 10,
-          maxBufferLength: 12,
-          maxMaxBufferLength: 30,
-          backBufferLength: 10,
-          initialLiveManifestSize: 1,
-          manifestLoadingMaxRetry: 6,
-          manifestLoadingRetryDelay: 500,
-          levelLoadingMaxRetry: 6,
-          levelLoadingRetryDelay: 500,
-          fragLoadingMaxRetry: 8,
-          fragLoadingRetryDelay: 400,
-        });
-        if (destroyed) return;
-        cardHlsInstanceRef.current = hls;
-        hls.loadSource(url);
-        hls.attachMedia(videoEl);
-        let fatalRecovers = 0;
-        hls.on(Hls.Events.MANIFEST_PARSED, () => {
-          videoEl.play().catch(() => {});
-        });
-        hls.on(Hls.Events.ERROR, (_e: any, data: any) => {
-          if (!data || !data.fatal) return;
-          if (fatalRecovers < 2) {
-            fatalRecovers += 1;
-            try {
-              if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
-              else hls.startLoad();
-            } catch {}
-            return;
-          }
-          triggerCardReconnect();
-        });
-      } catch {
-        // 忽略，保留快照兜底
-      }
-    };
-    run();
-    return () => {
-      destroyed = true;
-      if (stallTimer) clearTimeout(stallTimer);
-      videoEl.removeEventListener('error', onVideoError);
-      videoEl.removeEventListener('stalled', onStalled);
-      videoEl.removeEventListener('playing', onPlaying);
-      if (cardHlsInstanceRef.current) {
-        try { cardHlsInstanceRef.current.destroy(); } catch {}
-        cardHlsInstanceRef.current = null;
-      }
-      try {
-        videoEl.pause();
-        videoEl.removeAttribute('src');
-        videoEl.load();
-      } catch {}
-    };
-  }, [cardStream?.hlsUrl]);
 
   const handleStartRename = (event: MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
@@ -903,8 +679,128 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
     }
   };
 
+  const stopHls = () => {
+    if (hlsInstanceRef.current) {
+      try { hlsInstanceRef.current.destroy(); } catch {}
+      hlsInstanceRef.current = null;
+    }
+    if (hlsVideoRef.current) {
+      try { hlsVideoRef.current.pause(); hlsVideoRef.current.removeAttribute('src'); hlsVideoRef.current.load(); } catch {}
+    }
+  };
 
+  const startCameraStream = async () => {
+    if (!deviceDid) return;
+    try {
+      setOpenStreamLoading(true);
+      setStartStreamError('');
+      const res = await system.getCameraStream(deviceDid);
+      if (!res.ok) {
+        setStartStreamError(res.errorMessage || '开启视频流失败');
+        return;
+      }
+      setCurrentStream({
+        hlsUrl: res.hlsUrl,
+        webrtcUrl: res.webrtcUrl,
+        proxyMode: res.proxyMode,
+        processId: res.processId,
+        startedAt: res.startedAt,
+        ffmpegAvailable: res.ffmpegAvailable,
+      });
+      if (res.proxyMode && res.proxyMode !== 'ffmpeg-hls') {
+        setStartStreamError(`当前代理模式：${res.proxyMode}，需单独配置`);
+      }
+      if (!res.hlsUrl && res.ffmpegAvailable === false) {
+        setStartStreamError('服务器未检测到 ffmpeg，无法生成 HLS 切片。请安装 ffmpeg 后重试。');
+      }
+    } catch (error) {
+      setStartStreamError(error instanceof Error ? error.message : '开启视频流失败');
+    } finally {
+      setOpenStreamLoading(false);
+    }
+  };
 
+  useEffect(() => {
+    if (!cameraDetailOpen) return;
+    if (cameraViewTab !== 'live' || !currentStream?.hlsUrl || !hlsVideoRef.current) return;
+    const videoEl = hlsVideoRef.current;
+    const hlsUrl = currentStream.hlsUrl;
+    let destroyed = false;
+    const run = async () => {
+      const canNative = typeof videoEl.canPlayType === 'function' && videoEl.canPlayType('application/vnd.apple.mpegurl');
+      if (canNative) {
+        videoEl.src = hlsUrl;
+        try { await videoEl.play(); } catch {}
+        return;
+      }
+      try {
+        const Hls = (await import('hls.js')).default;
+        if (!Hls || !Hls.isSupported()) {
+          setStartStreamError('当前浏览器不支持 HLS 播放');
+          return;
+        }
+        const hls = new Hls({ lowLatencyMode: true, enableWorker: true });
+        if (destroyed) return;
+        hlsInstanceRef.current = hls;
+        hls.loadSource(hlsUrl);
+        hls.attachMedia(videoEl);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          videoEl.play().catch(() => {});
+        });
+        hls.on(Hls.Events.ERROR, (_e: any, data: any) => {
+          if (data && data.fatal) {
+            setStartStreamError(`HLS 播放错误：${data.type || ''} ${data.details || ''}`);
+          }
+        });
+      } catch (err) {
+        setStartStreamError(err instanceof Error ? err.message : 'HLS 初始化失败');
+      }
+    };
+    run();
+    return () => {
+      destroyed = true;
+      stopHls();
+    };
+  }, [cameraDetailOpen, cameraViewTab, currentStream?.hlsUrl]);
+
+  useEffect(() => {
+    if (cameraDetailOpen) return;
+    stopHls();
+    setCurrentStream(null);
+    setStartStreamError('');
+    setOpenStreamLoading(false);
+  }, [cameraDetailOpen]);
+
+  useEffect(() => {
+    if (!euCameraLoginInfo?.codeSentAt) return;
+    try {
+      const t0 = new Date(euCameraLoginInfo.codeSentAt as string).getTime();
+      if (!Number.isFinite(t0)) return;
+      const elapsed = Math.floor((Date.now() - t0) / 1000);
+      const remaining = Math.max(0, 60 - elapsed);
+      setOtpResendCountdown(remaining);
+    } catch {}
+  }, [euCameraLoginInfo?.codeSentAt]);
+
+  useEffect(() => {
+    if (otpResendCountdown <= 0) return;
+    const timer = setInterval(() => {
+      setOtpResendCountdown((prev) => Math.max(0, prev - 1));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [otpResendCountdown]);
+
+  const handleCameraPTZ = async (dir: 'left' | 'right' | 'up' | 'down' | 'stop') => {
+    if (!deviceDid || !canControl) return;
+    try {
+      setPtzLoading(true);
+      await system.controlCameraPTZ(deviceDid, dir, 50);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '云台控制失败');
+    } finally {
+      setPtzLoading(false);
+    }
+  };
 
   const handleTakeEvidenceSnapshot = async () => {
     if (!deviceDid) return;
@@ -938,15 +834,277 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
         try { document.body.removeChild(a); } catch {}
         try { URL.revokeObjectURL(url); } catch {}
       }, 500);
-      toast.success(`已保存截图：${filename}`);
+      toast.success(`已保存临时证据截图：${filename}`);
       setCameraSnapshotBump((prev) => prev + 1);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : '截图失败');
+      toast.error(error instanceof Error ? error.message : '临时截图失败');
     } finally {
       setTakeSnapshotLoading(false);
     }
   };
 
+  const handleEuCameraLogin = async () => {
+    try {
+      persistEuCameraRemember({ enabled: euCameraRemember.enabled, username: euCameraUsername.trim(), password: euCameraPassword, region: euCameraRegion })
+      setEuCameraLoginLoading(true);
+      setEuCameraVerificationCode('');
+      const params = {
+        username: euCameraUsername,
+        password: euCameraPassword,
+        region: euCameraRegion,
+      };
+      const res = await system.xiaomiCameraLogin(params);
+      const auth = res.auth ?? null;
+      const needsVerification =
+        res.needsVerification ?? auth?.needsVerification ?? false;
+      const verificationMethod =
+        res.verificationMethod ?? auth?.verificationMethod ?? null;
+      const notificationUrl =
+        res.notificationUrl ?? auth?.notificationUrl ?? null;
+      const authMessage = auth?.message ?? res.message ?? null;
+      const codeSentAt = auth?.codeSentAt ?? null;
+
+      if (res.loggedIn) {
+        toast.success(`已登录 EU 区米家：${res.username || '(env 账号)'} · ${res.region || 'de'}`);
+        persistEuCameraRemember({ enabled: euCameraRemember.enabled, username: euCameraUsername.trim(), password: euCameraRemember.enabled ? euCameraPassword : '', region: euCameraRegion })
+        setEuCameraPassword(euCameraRemember.enabled ? euCameraPassword : '')
+        setEuCameraLoginInfo({
+          loggedIn: true,
+          username: res.username,
+          region: res.region,
+          needsVerification: false,
+          verificationMethod: null,
+          notificationUrl: null,
+          authMessage: null,
+          codeSentAt: null,
+        });
+        await refreshEuCameraDevices();
+        return;
+      }
+
+      if (needsVerification) {
+        const msg =
+          authMessage ||
+          '米家 EU 触发了安全验证，正在自动向邮箱发送验证码，请稍后查收并输入';
+        toast.warning(msg);
+        setEuCameraLoginInfo({
+          loggedIn: false,
+          username: res.username,
+          region: res.region,
+          needsVerification: true,
+          verificationMethod: verificationMethod ?? 'email_code',
+          notificationUrl,
+          authMessage: msg,
+          codeSentAt,
+        });
+        if ((verificationMethod ?? 'email_code') === 'email_code') {
+          try {
+            setEuCameraOtpLoading('send');
+            const otpRes = await system.xiaomiCameraLogin({ sendEmailVerificationCode: true });
+            const otpAuth = otpRes.auth ?? null;
+            setEuCameraLoginInfo((prev) => ({
+              ...(prev ?? { loggedIn: false }),
+              needsVerification: true,
+              verificationMethod: otpRes.verificationMethod ?? 'email_code',
+              codeSentAt: otpAuth?.codeSentAt ?? new Date().toISOString(),
+              authMessage: otpAuth?.message ?? '米家验证码已发送到邮箱，输入 6 位数字后点提码',
+              notificationUrl: otpAuth?.notificationUrl ?? (prev as any)?.notificationUrl ?? null,
+            }));
+            toast.success(
+              otpRes.sent
+                ? '✅ 验证码已发送到 EU 邮箱，查收后直接填右边 6 位点提码即可'
+                : (otpAuth?.message || '验证码已触发，注意查收 EU 邮箱'),
+            );
+          } catch (err) {
+            toast.error((err as Error)?.message || '自动发送验证码失败，仍可稍后点发码');
+          } finally {
+            setEuCameraOtpLoading(null);
+          }
+        }
+        return;
+      }
+
+      toast.error(res.message || '登录欧洲区米家账号失败');
+      setEuCameraLoginInfo({
+        loggedIn: false,
+        username: res.username,
+        region: res.region,
+        needsVerification: false,
+        verificationMethod: null,
+        notificationUrl: null,
+        authMessage: res.message || null,
+        codeSentAt: null,
+      });
+    } catch (error: any) {
+      const data = (error as any)?.response?.data ?? null;
+      const needsVerification = data?.needsVerification ?? false;
+      const verificationMethod = data?.verificationMethod ?? data?.auth?.verificationMethod ?? null;
+      const notificationUrl = data?.notificationUrl ?? data?.auth?.notificationUrl ?? null;
+      const authMessage =
+        data?.auth?.message ?? data?.message ?? (error instanceof Error ? error.message : '登录 EU 区米家账号失败');
+
+      if (needsVerification) {
+        toast.warning(authMessage);
+        setEuCameraLoginInfo({
+          loggedIn: false,
+          username: data?.username,
+          region: data?.region,
+          needsVerification: true,
+          verificationMethod: verificationMethod ?? 'email_code',
+          notificationUrl,
+          authMessage,
+          codeSentAt: data?.auth?.codeSentAt ?? null,
+        });
+        if ((verificationMethod ?? 'email_code') === 'email_code') {
+          try {
+            setEuCameraOtpLoading('send');
+            const otpRes = await system.xiaomiCameraLogin({ sendEmailVerificationCode: true });
+            const otpAuth = otpRes.auth ?? null;
+            setEuCameraLoginInfo((prev) => ({
+              ...(prev ?? { loggedIn: false }),
+              needsVerification: true,
+              verificationMethod: otpRes.verificationMethod ?? 'email_code',
+              codeSentAt: otpAuth?.codeSentAt ?? new Date().toISOString(),
+              authMessage: otpAuth?.message ?? '米家验证码已发送到邮箱，输入 6 位数字后点提码',
+              notificationUrl: otpAuth?.notificationUrl ?? (prev as any)?.notificationUrl ?? null,
+            }));
+            toast.success(
+              otpRes.sent
+                ? '✅ 验证码已发送到 EU 邮箱，查收后直接填右边 6 位点提码即可'
+                : (otpAuth?.message || '验证码已触发，注意查收 EU 邮箱'),
+            );
+          } catch (err) {
+            toast.error((err as Error)?.message || '自动发送验证码失败，仍可稍后点发码');
+          } finally {
+            setEuCameraOtpLoading(null);
+          }
+        }
+      } else {
+        toast.error(authMessage);
+        setEuCameraLoginInfo({
+          loggedIn: false,
+          username: data?.username,
+          region: data?.region,
+          needsVerification: false,
+          verificationMethod: null,
+          notificationUrl: null,
+          authMessage,
+          codeSentAt: null,
+        });
+      }
+    } finally {
+      setEuCameraLoginLoading(false);
+    }
+  };
+
+  const handleEuCameraSendCode = async () => {
+    try {
+      setEuCameraOtpLoading('send');
+      const res = await system.xiaomiCameraLogin({ sendEmailVerificationCode: true });
+      const auth = res.auth ?? null;
+      toast.success(res.sent ? '验证码已发送到邮箱，查收后输入下方提交' : (auth?.message || '验证码已触发发送'));
+      setEuCameraLoginInfo((prev) => ({
+        ...(prev ?? { loggedIn: false }),
+        needsVerification: true,
+        verificationMethod: res.verificationMethod ?? 'email_code',
+        codeSentAt: auth?.codeSentAt ?? new Date().toISOString(),
+        authMessage: auth?.message ?? (prev as any)?.authMessage ?? null,
+        notificationUrl: auth?.notificationUrl ?? (prev as any)?.notificationUrl ?? null,
+      }));
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '发送邮箱验证码失败');
+    } finally {
+      setEuCameraOtpLoading(null);
+    }
+  };
+
+  const handleEuCameraVerifyCode = async () => {
+    const code = euCameraVerificationCode.trim();
+    if (!code) {
+      toast.error('请先输入邮箱验证码');
+      return;
+    }
+    try {
+      setEuCameraOtpLoading('verify');
+      const res = await system.xiaomiCameraLogin({ verificationCode: code });
+      if (res.loggedIn) {
+        const username = res.username ?? (res.auth as any)?.username ?? euCameraUsername;
+        const region = res.region ?? (res.auth as any)?.region ?? euCameraRegion;
+        toast.success(`✅ 验证码通过，已登录 EU 区米家${username ? ' ' + username : ''}${region ? ' · ' + region : ''}`);
+        persistEuCameraRemember({ enabled: euCameraRemember.enabled, username: username ? String(username).trim() : euCameraUsername.trim(), password: euCameraRemember.enabled ? euCameraPassword : '', region: region ? String(region) : euCameraRegion })
+        setEuCameraPassword(euCameraRemember.enabled ? euCameraPassword : '')
+        setEuCameraLoginInfo({
+          loggedIn: true,
+          username,
+          region,
+          devices: (res as any).devices ?? [],
+          needsVerification: false,
+          verificationMethod: null,
+          notificationUrl: null,
+          authMessage: null,
+          codeSentAt: null,
+        });
+        setEuCameraVerificationCode('');
+        try { await refreshEuCameraDevices(); } catch {}
+        return;
+      }
+      const auth = (res as any).auth ?? null;
+      setEuCameraLoginInfo((prev) => ({
+        ...(prev ?? { loggedIn: false }),
+        loggedIn: false,
+        username: auth?.username ?? (prev as any)?.username ?? null,
+        region: auth?.region ?? (prev as any)?.region ?? null,
+        devices: (res as any).devices ?? (prev as any)?.devices ?? [],
+        needsVerification: auth?.needsVerification ?? false,
+        verificationMethod: auth?.verificationMethod ?? null,
+        notificationUrl: auth?.notificationUrl ?? null,
+        authMessage: auth?.message ?? res.message ?? '验证码校验失败',
+        codeSentAt: auth?.codeSentAt ?? null,
+      }));
+      toast.error(auth?.message ?? res.message ?? '验证码校验失败，再检查邮件里最新的 6 位数字');
+    } catch (error: any) {
+      const data = (error as any)?.response?.data ?? null;
+      const auth = data?.auth ?? null;
+      const msg = auth?.message ?? data?.message ?? (error instanceof Error ? error.message : '验证码校验失败');
+      setEuCameraLoginInfo((prev) => ({
+        ...(prev ?? { loggedIn: false }),
+        loggedIn: false,
+        username: auth?.username ?? (prev as any)?.username ?? null,
+        region: auth?.region ?? (prev as any)?.region ?? null,
+        needsVerification: auth?.needsVerification ?? false,
+        verificationMethod: auth?.verificationMethod ?? null,
+        notificationUrl: auth?.notificationUrl ?? null,
+        authMessage: msg,
+        codeSentAt: auth?.codeSentAt ?? null,
+      }));
+      toast.error(msg);
+    } finally {
+      setEuCameraOtpLoading(null);
+    }
+  };
+
+  const refreshEuCameraDevices = async () => {
+    try {
+      const res = await system.xiaomiCameraDevices();
+      setEuCameraLoginInfo({
+        loggedIn: res.loggedIn,
+        username: res.username,
+        region: res.region,
+        devices: res.devices,
+        needsVerification: res.loggedIn ? false : (res as any)?.auth?.needsVerification ?? false,
+        verificationMethod: res.loggedIn ? null : (res as any)?.auth?.verificationMethod ?? null,
+        notificationUrl: res.loggedIn ? null : (res as any)?.auth?.notificationUrl ?? null,
+        authMessage: res.loggedIn ? null : (res as any)?.auth?.message ?? null,
+        codeSentAt: res.loggedIn ? null : (res as any)?.auth?.codeSentAt ?? null,
+      });
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '获取 EU 区摄像头列表失败');
+    }
+  };
+
+  void handleEuCameraLogin;
+  void handleEuCameraSendCode;
+  void handleEuCameraVerifyCode;
 
   return (
     <>
@@ -1089,45 +1247,25 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
                 style={{ minHeight: '280px' }}
               >
                 <div className="absolute inset-0">
-                  {cardStream?.hlsUrl ? (
-                    <video
-                      ref={cardVideoRef}
-                      autoPlay
-                      muted
-                      playsInline
-                      className="h-full w-full object-contain"
-                      style={{ background: '#000' }}
-                    />
-                  ) : cameraSnapshotThumbUrl ? (
+                  {cameraSnapshotThumbUrl ? (
                     <img
                       key={cameraSnapshotThumbUrl + '_' + snapshotThumbReloadRef.current}
                       src={cameraSnapshotThumbUrl}
                       alt={room.title + ' 实时快照'}
-                      className="h-full w-full object-contain"
+                      className="h-full w-full object-cover"
                       onError={() => {}}
                     />
                   ) : (
                     <div className="flex h-full w-full flex-col items-center justify-center gap-1 px-2 text-center text-[10px] leading-4 text-slate-400">
-                      <span>暂无可渲染的画面</span>
+                      <span>暂无可渲染的快照来源</span>
                       <span className="text-slate-500">点右上角查看详情后再配置接入</span>
                     </div>
                   )}
                 </div>
-                {room.deviceOnline ? (
-                  <div className="pointer-events-none absolute left-1 top-1 inline-flex items-center gap-1 rounded bg-black/55 px-1.5 py-0.5 text-[10px] font-medium text-emerald-100">
-                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                    LIVE
-                  </div>
-                ) : (
-                  <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-2 bg-slate-900/35">
-                    <span className="flex h-14 w-14 items-center justify-center rounded-full bg-black/45">
-                      <WifiOff className="h-7 w-7 text-white/75" />
-                    </span>
-                    <span className="rounded bg-black/50 px-2 py-0.5 text-[11px] font-medium text-white/80">
-                      离线 / 连接断开
-                    </span>
-                  </div>
-                )}
+                <div className="pointer-events-none absolute left-1 top-1 inline-flex items-center gap-1 rounded bg-black/55 px-1.5 py-0.5 text-[10px] font-medium text-rose-100">
+                  <span className="h-1.5 w-1.5 rounded-full bg-rose-500 animate-pulse" />
+                  LIVE
+                </div>
                 <div className="pointer-events-auto absolute right-1.5 top-1.5 inline-flex gap-1">
                   <button
                     type="button"
@@ -1146,7 +1284,7 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
                     className="rounded-full bg-black/55 p-1 text-white/85 hover:bg-black/70"
                     onClick={(event) => {
                       event.stopPropagation();
-                      navigate('/cameras');
+                      setCameraDetailOpen(true);
                     }}
                     title="查看画面"
                   >
@@ -1156,24 +1294,40 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
               </div>
               {(() => {
                 const cam = (firstDevice as any)?.camera ?? null;
-                const caps = [
-                  { key: 'audio', label: '录音', show: cam?.hasAudio === true, Icon: Mic },
-                  { key: 'motion', label: '移动侦测', show: cam?.hasMotion === true || typeof cam?.lastMotionAt === 'string', Icon: BellRing },
-                  { key: 'night', label: '夜视', show: cam?.hasNightVision === true, Icon: Moon },
-                  { key: 'recording', label: '录像存储', show: cam?.hasRecording === true, Icon: HardDrive },
-                ].filter((c) => c.show);
-                if (caps.length === 0) return null;
+                const hasAudio = cam?.hasAudio === true || cam?.audioEnabled === true;
+                const hasMotion = typeof cam?.lastMotionAt === 'string' || cam?.motionEnabled === true;
+                const hasNight = cam?.hasNightVision === true || cam?.nightVision === true || cam?.nightMode === true;
+                const hasRecording = cam?.recordingEnabled === true || cam?.storageEnabled === true || cam?.sdCard === true;
+                const tone = (ok: boolean) =>
+                  ok
+                    ? 'text-emerald-600 dark:text-emerald-400 border-emerald-400/50 bg-emerald-50/60 dark:bg-emerald-950/30'
+                    : 'text-rose-600 dark:text-rose-400 border-rose-400/50 bg-rose-50/60 dark:bg-rose-950/30';
                 return (
-                  <div className="w-full flex flex-wrap gap-1">
-                    {caps.map(({ key, label, Icon }) => (
-                      <div
-                        key={key}
-                        className="inline-flex items-center gap-1 rounded-md border border-emerald-400/50 bg-emerald-50/60 px-2 py-1 text-[10.5px] text-emerald-600 dark:border-emerald-400/50 dark:bg-emerald-950/30 dark:text-emerald-400"
-                      >
-                        <Icon className="h-3 w-3 shrink-0" />
-                        <span className="truncate">{label}</span>
+                  <div className="w-full grid grid-cols-4 gap-1">
+                    <div className="min-w-0">
+                      <div className={`inline-flex w-full items-center justify-center gap-1 rounded-md border px-2 py-1 text-[10.5px] ${tone(hasAudio)}`}>
+                        <Mic className="h-3 w-3 shrink-0" />
+                        <span className="truncate">录音</span>
                       </div>
-                    ))}
+                    </div>
+                    <div className="min-w-0">
+                      <div className={`inline-flex w-full items-center justify-center gap-1 rounded-md border px-2 py-1 text-[10.5px] ${tone(hasMotion)}`}>
+                        <BellRing className="h-3 w-3 shrink-0" />
+                        <span className="truncate">移动侦测</span>
+                      </div>
+                    </div>
+                    <div className="min-w-0">
+                      <div className={`inline-flex w-full items-center justify-center gap-1 rounded-md border px-2 py-1 text-[10.5px] ${tone(hasNight)}`}>
+                        <Moon className="h-3 w-3 shrink-0" />
+                        <span className="truncate">夜视</span>
+                      </div>
+                    </div>
+                    <div className="min-w-0">
+                      <div className={`inline-flex w-full items-center justify-center gap-1 rounded-md border px-2 py-1 text-[10.5px] ${tone(hasRecording)}`}>
+                        <HardDrive className="h-3 w-3 shrink-0" />
+                        <span className="truncate">录像存储</span>
+                      </div>
+                    </div>
                   </div>
                 );
               })()}
@@ -1552,6 +1706,26 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
               {primaryCategoryLabel} {Object.values(categoryCounts).reduce((a, b) => a + b, 0) || '无'}
             </Badge>
           ) : null}
+          {primaryCategory !== DeviceCategory.CAMERA && room.deviceOnline ? (
+            <Badge variant="success" className="text-[10px]">
+              {typeof room.deviceOnline === 'number' && isPublicFacility
+                ? `在线 ${room.deviceOnline} 台`
+                : '设备在线'}
+            </Badge>
+          ) : primaryCategory !== DeviceCategory.CAMERA && !room.deviceOnline ? (
+            <TooltipProvider delayDuration={150}>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Badge variant="destructive" className="cursor-help text-[10px]">
+                    设备离线
+                  </Badge>
+                </TooltipTrigger>
+                <TooltipContent className="max-w-[260px] text-xs leading-5">
+                  设备已离线，请检查上一级控开及总电源。
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          ) : null}
           {cooldownActive ? (
             <Badge variant="outline" className="text-[10px]">
               {cooldownLabel}
@@ -1615,7 +1789,11 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
                     计费
                   </Button>
                 </div>
-              ) : null}
+              ) : (
+                <Badge variant={room.deviceOnline ? 'success' : 'destructive'} className="text-[10px]">
+                  {room.deviceOnline ? '设备在线' : '设备离线'}
+                </Badge>
+              )}
             </div>
           ) : null}
           <div className="flex flex-wrap gap-2">
@@ -1627,7 +1805,7 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
                   className="h-8 min-w-0 flex-1 basis-[120px] text-[clamp(0.72rem,0.95vw,0.78rem)] bg-indigo-600 hover:bg-indigo-700"
                   onClick={(event) => {
                     event.stopPropagation();
-                    navigate('/cameras');
+                    setCameraDetailOpen(true);
                   }}
                 >
                   查看详情
@@ -1747,197 +1925,750 @@ export function RoomCard({ room, pricePerKwh }: RoomCardProps) {
                   <Settings className="mr-1 h-3.5 w-3.5" /> 设备设置
                 </Button>
               </>
-            ) : (primaryCategory === DeviceCategory.OTHER || (!room.roomId && !isPublicFacility)) ? (
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-9 min-w-0 flex-1 basis-[120px] text-[clamp(0.72rem,0.95vw,0.78rem)]"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  openDeviceDetail();
-                }}
-              >
-                <Settings className="mr-1 h-3.5 w-3.5" /> 查看 / 分类
-              </Button>
             ) : null}
           </div>
         </div>
       </CardContent>
     </Card>
 
-    <Dialog open={deviceDetailOpen} onOpenChange={setDeviceDetailOpen}>
-      <DialogContent onClick={(event) => event.stopPropagation()}>
-        <DialogHeader>
-          <DialogTitle>{room.title || '设备详情'}</DialogTitle>
-          <DialogDescription>未分类设备：可查看信息、手动归类或重命名。</DialogDescription>
+    <Dialog
+      open={cameraDetailOpen}
+      onOpenChange={(next) => {
+        setCameraDetailOpen(next);
+        if (!next) setHelpModalTopic(null);
+      }}
+    >
+      <DialogContent
+        onClick={(event) => event.stopPropagation()}
+        className="sm:max-w-6xl max-h-[92vh] h-[90vh] flex flex-col p-0 overflow-hidden"
+      >
+        <DialogHeader className="px-4 pt-4 pb-2 border-b shrink-0">
+          <DialogTitle className="inline-flex flex-wrap items-center gap-2 text-[clamp(0.88rem,1.1vw,0.98rem)]">
+            <CameraIcon className="h-4 w-4 text-indigo-600 dark:text-indigo-400" />
+            {room.title} · 实时监控
+            <div className="ml-auto inline-flex flex-wrap items-center gap-1">
+              {firstDevice?.vendorName ? (
+                <Badge variant="outline" className="text-[10px]">
+                  厂商 {firstDevice.vendorName}
+                </Badge>
+              ) : null}
+              {firstDevice?.ipAddress ? (
+                <Badge variant="outline" className="text-[10px]">
+                  IP {firstDevice.ipAddress}
+                </Badge>
+              ) : null}
+              {firstDevice?.macAddress ? (
+                <Badge variant="outline" className="text-[10px]">
+                  MAC {firstDevice.macAddress}
+                </Badge>
+              ) : null}
+              <TooltipProvider delayDuration={150}>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className={cn(
+                        'h-7 rounded-md px-2 text-[11px]',
+                        cameraViewTab === 'settings'
+                          ? 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200'
+                          : 'text-slate-500 hover:text-slate-700 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800',
+                      )}
+                      onClick={() => setCameraViewTab(cameraViewTab === 'settings' ? 'live' : 'settings')}
+                    >
+                      <Settings className="mr-1 h-3.5 w-3.5" /> {cameraViewTab === 'settings' ? '返回监控' : '设置'}
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom" className="text-[11px]">
+                    {cameraViewTab === 'settings' ? '返回实时监控画面' : '接入配置'}
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            </div>
+          </DialogTitle>
+          <DialogDescription className="hidden"></DialogDescription>
         </DialogHeader>
-        <div className="space-y-3">
-          <div className="rounded-md bg-muted/40 p-3 text-xs leading-5">
-            {(() => {
-              const any = firstDevice as any;
-              const rows: Array<[string, string]> = [
-                ['DID', String(deviceDid ?? '--')],
-                ['名称', String(any?.name ?? room.title ?? '--')],
-                ['类型', inferEndpointTypeLabel({
-                  name: any?.name ?? null,
-                  hostname: any?.hostname ?? any?.hostName ?? null,
-                  vendor: any?.vendorName ?? any?.vendor ?? any?.manufacturer ?? null,
-                  systemCategory: any?.category ?? null,
-                })],
-                ['型号', String(any?.model ?? any?.modelName ?? '--')],
-                ['厂商', String(any?.vendorName ?? any?.vendor ?? any?.manufacturer ?? '--')],
-                ['MAC', String(any?.mac ?? any?.macAddress ?? '--')],
-                ['IP', String(any?.ipAddress ?? any?.ip ?? '--')],
-                ['状态', any?.status === 'online' ? '在线' : any?.status === 'offline' ? '离线' : '未知'],
-              ];
-              return rows.map(([label, value]) => (
-                <div key={label} className="flex justify-between gap-3 border-b border-slate-200/60 py-1 last:border-0 dark:border-slate-700/50">
-                  <span className="shrink-0 text-muted-foreground">{label}</span>
-                  <span className="min-w-0 break-all text-right font-medium">{value}</span>
-                </div>
-              ));
-            })()}
+
+        {helpModalTopic ? (
+          <div className="relative flex-1 overflow-hidden flex flex-col bg-slate-50 dark:bg-slate-950/60">
+            <div className="flex items-center gap-2 px-4 py-2 border-b bg-white dark:bg-slate-900 shrink-0">
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-7 px-2 text-[11px]"
+                onClick={() => setHelpModalTopic(null)}
+              >
+                <ArrowLeft className="mr-1 h-3.5 w-3.5" /> 返回
+              </Button>
+              <span className="text-[12px] font-medium text-slate-700 dark:text-slate-200">
+                {helpModalTopic === 'eu' ? '接入说明 · 米家 EU 官方接入' : '接入说明 · 纯局域网手动配置'}
+              </span>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-7 px-2 ml-auto rounded-full"
+                onClick={() => setHelpModalTopic(null)}
+              >
+                <X className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+            <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3 text-[12px] leading-6 text-slate-700 dark:text-slate-300">
+              {helpModalTopic === 'eu' ? (
+                <>
+                  <div className="rounded-md bg-indigo-50 dark:bg-indigo-950/30 border border-indigo-200/60 dark:border-indigo-800/50 px-3 py-2">
+                    <div className="font-semibold text-indigo-700 dark:text-indigo-300 mb-0.5">C301 / MBCMC23 接入方式 ①（推荐，免手动开关）</div>
+                    你不需要在小米国际版 App 里翻开关、记密码。本面板直接通过 EU 米家官方授权，调用官方 MiOT Action <span className="font-mono">start-rtsp-stream</span>，自动拿到 RTSP 地址，然后服务器 ffmpeg 切片 HLS 播放。
+                  </div>
+                  <div className="space-y-1.5">
+                    <div className="font-semibold text-slate-800 dark:text-slate-200">📋 字段说明</div>
+                    <ul className="list-disc pl-5 space-y-1">
+                      <li><span className="font-mono">EU 米家账号 / 密码</span>：<a className="text-indigo-600 dark:text-indigo-400 underline" href="https://account.xiaomi.com/" target="_blank" rel="noreferrer noopener">小米账号系统</a> 里与中国区独立的欧洲区账号，在米家 App（国际版）注册使用，登录服务器选德国/法国等欧洲节点。<span className="font-semibold text-rose-600">中国区的小米账号直接登录无法发现国际版 C301</span>。</li>
+                      <li><span className="font-mono">地区</span>：按你注册时选的区域填；不确定就试 de / sg / us，登录成功后会话与该区域绑定。</li>
+                    </ul>
+                  </div>
+                  <div className="space-y-1.5">
+                    <div className="font-semibold text-slate-800 dark:text-slate-200">🔁 流程</div>
+                    <ol className="list-decimal pl-5 space-y-1">
+                      <li>填 EU 米家账号 + 密码 → 点「登录」（不影响中国区 10 个房间的空开）</li>
+                      <li>会话建立后会自动列出 EU 账号下所有设备（型号为 MBCMC23 即为 C301）</li>
+                      <li>回到实时监控视图 → 点「开启实时流」：服务器会通过 MiOT Action 调 <span className="font-mono">start-rtsp-stream</span> → 服务器 ffmpeg 切片为 HLS 播放</li>
+                    </ol>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="rounded-md bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200/60 dark:border-emerald-800/50 px-3 py-2">
+                    <div className="font-semibold text-emerald-700 dark:text-emerald-300 mb-0.5">C301 / MBCMC23 接入方式 ②（纯局域网直连 · 先在 App 里一次性开启 RTSP）</div>
+                    本面板<b>同时适用于小米 C301 / MBCMC23</b> 与 Sigmastar / 海康 / 大华等其他 IP 摄像头。先在手机 App 里一次性打开 RTSP 开关，拿到 URL 和账号密码后填到下方，之后即可长期离线观看。
+                  </div>
+                  <div className="space-y-1.5">
+                    <div className="font-semibold text-slate-800 dark:text-slate-200">📱 C301 App 内开启步骤</div>
+                    <ol className="list-decimal pl-5 space-y-1">
+                      <li>打开 <span className="font-mono">Xiaomi Home 国际版</span> → 进入 C301 摄像头详情页 → 点右上角 ⚙「设置」</li>
+                      <li>找 <span className="font-mono">高级设置 / 局域网设置 / RTSP 服务</span>（不同固件版本命名略有差异），打开 <span className="font-mono">RTSP</span> 开关</li>
+                      <li>在同页面设置 <span className="font-mono">摄像头 RTSP 登录密码</span>，<span className="font-semibold">默认账号固定为 admin，密码就是你在这一步自己设的，≠ 米家账号密码</span></li>
+                      <li>App 会展示完整的 RTSP URL（如 <span className="font-mono">rtsp://admin:xxxx@192.168.1.200:554/live</span>），整串抄到下方「快照 URL」，并在账号 / 密码栏填刚才设的 admin / 对应密码</li>
+                    </ol>
+                  </div>
+                  <div className="space-y-1.5">
+                    <div className="font-semibold text-slate-800 dark:text-slate-200">📋 字段说明</div>
+                    <ul className="list-disc pl-5 space-y-1">
+                      <li><span className="font-mono">快照 URL</span>：C301 填 RTSP 整串即可；其他品牌也可以填 HTTP 快照 URL（从 Web 后台「网络 / 快照」菜单或 ONVIF Device Manager 里拿）</li>
+                      <li><span className="font-mono">账号 / 密码</span>：对 C301 来说，就是你在 App 里开 RTSP 时自己设的 admin + 对应密码；其他品牌就是 Web 后台的登录名/密码</li>
+                      <li><span className="font-mono">鉴权</span>：海康全系 Digest；老款雄迈/大华可能 Basic；不确定的话 C301 选「Digest」先试</li>
+                      <li><span className="font-mono">厂商 / 型号</span>：只用于显示，照机身贴纸抄即可（C301 推荐填 MBCMC23）</li>
+                    </ul>
+                  </div>
+                  <div className="space-y-1.5">
+                    <div className="font-semibold text-slate-800 dark:text-slate-200">📐 常见品牌 URL / 路径模板</div>
+                    <table className="w-full text-[11.5px] border-collapse">
+                      <tbody>
+                        <tr className="border-b border-slate-200 dark:border-slate-700">
+                          <td className="py-1.5 pr-3 font-medium whitespace-nowrap">小米 C301 / MBCMC23 · 主码流</td>
+                          <td className="py-1.5"><span className="font-mono text-slate-600 dark:text-slate-400">rtsp://admin:密码@IP:554/live</span></td>
+                        </tr>
+                        <tr className="border-b border-slate-200 dark:border-slate-700">
+                          <td className="py-1.5 pr-3 font-medium whitespace-nowrap">小米 C301 / MBCMC23 · 子码流</td>
+                          <td className="py-1.5"><span className="font-mono text-slate-600 dark:text-slate-400">rtsp://admin:密码@IP:554/sub</span></td>
+                        </tr>
+                        <tr className="border-b border-slate-200 dark:border-slate-700">
+                          <td className="py-1.5 pr-3 font-medium whitespace-nowrap">小米 C301 · 备选模板</td>
+                          <td className="py-1.5"><span className="font-mono text-slate-600 dark:text-slate-400">/Streaming/Channels/101</span></td>
+                        </tr>
+                        <tr className="border-b border-slate-200 dark:border-slate-700">
+                          <td className="py-1.5 pr-3 font-medium">海康 / Dahua</td>
+                          <td className="py-1.5"><span className="font-mono text-slate-600 dark:text-slate-400">/ISAPI/Streaming/channels/101/picture</span></td>
+                        </tr>
+                        <tr className="border-b border-slate-200 dark:border-slate-700">
+                          <td className="py-1.5 pr-3 font-medium">Sigmastar</td>
+                          <td className="py-1.5"><span className="font-mono text-slate-600 dark:text-slate-400">/snapshot.jpg</span></td>
+                        </tr>
+                        <tr className="border-b border-slate-200 dark:border-slate-700">
+                          <td className="py-1.5 pr-3 font-medium">TP-Link / 水星</td>
+                          <td className="py-1.5"><span className="font-mono text-slate-600 dark:text-slate-400">/cgi-bin/snapshot.cgi?channel=1</span></td>
+                        </tr>
+                        <tr>
+                          <td className="py-1.5 pr-3 font-medium">雄迈 / 宇视</td>
+                          <td className="py-1.5"><span className="font-mono text-slate-600 dark:text-slate-400">/cgi-bin/snapshot.cgi</span></td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+            </div>
           </div>
-          <div className="space-y-2 rounded-md border border-indigo-200/60 bg-indigo-50/40 p-3 dark:border-indigo-800/40 dark:bg-indigo-950/20">
-            <Label className="flex items-center gap-1.5 text-[12px] font-semibold text-indigo-700 dark:text-indigo-300">
-              <Power className="h-3.5 w-3.5" /> 局域网控制（无需厂商云）
-            </Label>
-            <div className="space-y-2">
-              <div>
-                <Label className="text-[10.5px]">控制协议</Label>
-                <Select value={controlProtocol} onValueChange={setControlProtocol} disabled={!canControl}>
-                  <SelectTrigger className="h-8 w-full text-xs">
-                    <SelectValue placeholder="未启用（走厂商云）" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="">未启用</SelectItem>
-                    <SelectItem value="http">HTTP / JSON 开关</SelectItem>
-                    <SelectItem value="modbus_tcp">Modbus TCP 断路器</SelectItem>
-                    <SelectItem value="tuya_local">涂鸦本地（开发中）</SelectItem>
-                    <SelectItem value="miio_lan">MiIO LAN（开发中）</SelectItem>
-                  </SelectContent>
-                </Select>
+        ) : cameraViewTab === 'settings' ? (
+          <div className="flex-1 overflow-y-auto space-y-2.5 px-4 py-3">
+            {(() => {
+              const cam = (firstDevice as any)?.camera ?? null;
+              const hasAudio = cam?.hasAudio === true || cam?.audioEnabled === true;
+              const hasMotion = typeof cam?.lastMotionAt === 'string' || cam?.motionEnabled === true;
+              const hasNight = cam?.hasNightVision === true || cam?.nightVision === true || cam?.nightMode === true;
+              const hasRecording = cam?.recordingEnabled === true || cam?.storageEnabled === true || cam?.sdCard === true;
+              const tone = (ok: boolean) =>
+                ok
+                  ? 'text-emerald-600 dark:text-emerald-400 border-emerald-400/50 bg-emerald-50/60 dark:bg-emerald-950/30'
+                  : 'text-rose-600 dark:text-rose-400 border-rose-400/50 bg-rose-50/60 dark:bg-rose-950/30';
+              return (
+                <div className="w-full grid grid-cols-2 md:grid-cols-4 gap-1">
+                  <div className="min-w-0">
+                    <div className={`inline-flex w-full items-center justify-center gap-1 rounded-md border px-2 py-1 text-[11px] ${tone(hasAudio)}`}>
+                      <Mic className="h-3.5 w-3.5 shrink-0" />
+                      <span className="truncate">录音</span>
+                    </div>
+                  </div>
+                  <div className="min-w-0">
+                    <div className={`inline-flex w-full items-center justify-center gap-1 rounded-md border px-2 py-1 text-[11px] ${tone(hasMotion)}`}>
+                      <BellRing className="h-3.5 w-3.5 shrink-0" />
+                      <span className="truncate">移动侦测</span>
+                    </div>
+                  </div>
+                  <div className="min-w-0">
+                    <div className={`inline-flex w-full items-center justify-center gap-1 rounded-md border px-2 py-1 text-[11px] ${tone(hasNight)}`}>
+                      <Moon className="h-3.5 w-3.5 shrink-0" />
+                      <span className="truncate">夜视</span>
+                    </div>
+                  </div>
+                  <div className="min-w-0">
+                    <div className={`inline-flex w-full items-center justify-center gap-1 rounded-md border px-2 py-1 text-[11px] ${tone(hasRecording)}`}>
+                      <HardDrive className="h-3.5 w-3.5 shrink-0" />
+                      <span className="truncate">录像存储</span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+            <div className="inline-flex flex-wrap items-center gap-2 text-[11px]">
+              {currentStream?.hlsUrl ? (
+                <Badge variant="success" className="w-fit text-[10px]">
+                  实时流 已就绪
+                </Badge>
+              ) : euCameraLoginInfo?.loggedIn ? (
+                <Badge variant="success" className="w-fit text-[10px]">
+                  米家 EU 账号已登录 {euCameraLoginInfo.region || 'de'}
+                  {euCameraLoginInfo.username ? ` · ${euCameraLoginInfo.username}` : ''}
+                </Badge>
+              ) : (
+                <>
+                  <Badge variant="outline" className="w-fit text-[10px] border-slate-300 text-slate-500">
+                    尚未配置接入
+                  </Badge>
+                  <span className="text-[10.5px] text-slate-500 dark:text-slate-400">
+                    需要时展开下方接入配置。
+                  </span>
+                </>
+              )}
+            </div>
+            <div className="grid grid-cols-1 gap-2.5 lg:grid-cols-2">
+              <div className="rounded-md border bg-muted/20">
+                <button
+                  type="button"
+                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs font-medium hover:bg-muted/40"
+                  onClick={() => setEuCameraLoginExpanded((v) => !v)}
+                >
+                  {euCameraLoginExpanded ? (
+                    <ChevronDown className="h-3.5 w-3.5 text-slate-500" />
+                  ) : (
+                    <ChevronRight className="h-3.5 w-3.5 text-slate-500" />
+                  )}
+                  🔐 米家 EU 官方接入
+                {euCameraLoginInfo?.loggedIn ? (
+                  <Badge variant="success" className="ml-2 text-[10px]">
+                    已登录 {euCameraLoginInfo.region || 'de'}
+                  </Badge>
+                ) : (
+                  <Badge variant="secondary" className="ml-2 text-[10px]">未登录</Badge>
+                )}
+                <div className="ml-auto inline-flex items-center gap-1">
+                  <span className="text-[10px] text-slate-400 hidden sm:inline">C301 / MBCMC23 推荐</span>
+                  <TooltipProvider delayDuration={150}>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setHelpModalTopic('eu');
+                          }}
+                          className="ml-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-slate-300 dark:border-slate-700 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                        >
+                          <HelpCircle className="h-3.5 w-3.5" />
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent side="bottom" className="text-[11px]">查看接入说明</TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
+              </button>
+              {euCameraLoginExpanded ? (
+                <div className="space-y-2.5 border-t px-3 py-3">
+                  <div className="rounded-md border border-indigo-200/70 bg-indigo-50/70 px-3 py-2 text-[11px] leading-5 text-indigo-800 dark:border-indigo-800/60 dark:bg-indigo-950/30 dark:text-indigo-200">
+                    欧区米家账号登录已经转移到「系统设置 {'>'} 设备同步 {'>'} 账号同步」统一管理。
+                    <div className="mt-1.5 text-[10.5px] text-indigo-700/90 dark:text-indigo-300/90">
+                      这里不再重复放账号、密码和验证码表单，登录后本摄像头会直接复用后台已建立的欧洲区会话。
+                    </div>
+                  </div>
+                  <div className="rounded-md border bg-muted/30 px-3 py-2 text-[10.5px] text-muted-foreground">
+                    当前会话状态：
+                    {euCameraLoginInfo?.loggedIn
+                      ? ` 已登录 ${euCameraLoginInfo.region ? `(${euCameraLoginInfo.region.toUpperCase()})` : ''}${euCameraLoginInfo.username ? ` · ${euCameraLoginInfo.username}` : ''}`
+                      : ' 未登录'}
+                  </div>
+                </div>
+              ) : null}
+            </div>
+              <div className="rounded-md border bg-muted/20">
+                <button
+                  type="button"
+                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs font-medium hover:bg-muted/40"
+                  onClick={() => setCameraManualExpanded((v) => !v)}
+                >
+                {cameraManualExpanded ? (
+                  <ChevronDown className="h-3.5 w-3.5 text-slate-500" />
+                ) : (
+                  <ChevronRight className="h-3.5 w-3.5 text-slate-500" />
+                )}
+                🌐 纯局域网手动配置
+                <div className="ml-auto inline-flex items-center gap-1">
+                  <TooltipProvider delayDuration={150}>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setHelpModalTopic('lan');
+                          }}
+                          className="ml-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-slate-300 dark:border-slate-700 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                        >
+                          <HelpCircle className="h-3.5 w-3.5" />
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent side="bottom" className="text-[11px]">查看字段来源与品牌模板</TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
+              </button>
+              {cameraManualExpanded ? (
+                <div className="space-y-2.5 border-t px-3 py-3">
+                  <div className="space-y-1.5">
+                    <div className="space-y-1">
+                      <Label htmlFor={`cam-manual-url-${room.key}`} className="text-[11px]">快照 URL</Label>
+                      <Input
+                        id={`cam-manual-url-${room.key}`}
+                        size={16}
+                        className="h-8 text-xs font-mono"
+                        placeholder="rtsp://admin:xxx@192.168.x.x:554/live  或  http://192.168.x.x/cgi-bin/snapshot.cgi"
+                        value={camManualSnapshotUrl}
+                        onChange={(e) => setCamManualSnapshotUrl(e.target.value)}
+                      />
+                    </div>
+                    <div className="grid grid-cols-3 gap-2">
+                      <div className="col-span-1 space-y-1">
+                        <Label htmlFor={`cam-manual-user-${room.key}`} className="text-[11px]">账号</Label>
+                        <Input
+                          id={`cam-manual-user-${room.key}`}
+                          size={16}
+                          className="h-8 text-xs"
+                          placeholder="admin"
+                          value={camManualAuthUsername}
+                          onChange={(e) => setCamManualAuthUsername(e.target.value)}
+                        />
+                      </div>
+                      <div className="col-span-1 space-y-1">
+                        <Label htmlFor={`cam-manual-pass-${room.key}`} className="text-[11px]">密码</Label>
+                        <Input
+                          id={`cam-manual-pass-${room.key}`}
+                          type="password"
+                          size={16}
+                          className="h-8 text-xs"
+                          placeholder=""
+                          value={camManualAuthPassword}
+                          onChange={(e) => setCamManualAuthPassword(e.target.value)}
+                        />
+                      </div>
+                      <div className="col-span-1 space-y-1">
+                        <Label htmlFor={`cam-manual-auth-${room.key}`} className="text-[11px]">鉴权</Label>
+                        <Select value={camManualAuthType} onValueChange={(v) => setCamManualAuthType(v as any)}>
+                          <SelectTrigger id={`cam-manual-auth-${room.key}`} className="h-8 text-xs">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="digest">Digest</SelectItem>
+                            <SelectItem value="basic">Basic</SelectItem>
+                            <SelectItem value="none">无</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="space-y-1">
+                        <Label htmlFor={`cam-manual-brand-${room.key}`} className="text-[11px]">厂商</Label>
+                        <Input
+                          id={`cam-manual-brand-${room.key}`}
+                          size={16}
+                          className="h-8 text-xs"
+                          placeholder="Xiaomi / Hikvision"
+                          value={camManualBrand}
+                          onChange={(e) => setCamManualBrand(e.target.value)}
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <Label htmlFor={`cam-manual-model-${room.key}`} className="text-[11px]">型号</Label>
+                        <Input
+                          id={`cam-manual-model-${room.key}`}
+                          size={16}
+                          className="h-8 text-xs"
+                          placeholder="C301 / MBCMC23"
+                          value={camManualModel}
+                          onChange={(e) => setCamManualModel(e.target.value)}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-8 text-[11px]"
+                      onClick={() => setCameraDetailOpen(false)}
+                    >
+                      关闭
+                    </Button>
+                    <Button
+                      size="sm"
+                      className="h-8 bg-indigo-600 text-[11px] hover:bg-indigo-700"
+                      onClick={handleSaveCameraManual}
+                      disabled={savingCameraManual || !deviceDid}
+                    >
+                      <RefreshCw className="mr-1 h-3 w-3" />
+                      {savingCameraManual ? '保存中...' : '保存并刷新快照'}
+                    </Button>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+            </div>
+          </div>
+        ) : (
+          <div className="flex-1 flex flex-col gap-2.5 px-4 py-3 overflow-hidden">
+            <div className="rounded-md border bg-slate-950/90 flex-1 min-h-0 flex items-stretch justify-stretch overflow-hidden">
+              <div className="relative w-full h-full flex items-center justify-center">
+                {currentStream?.hlsUrl ? (
+                  <video
+                    ref={hlsVideoRef}
+                    autoPlay
+                    muted
+                    playsInline
+                    controls
+                    className="h-full w-full object-contain"
+                    style={{ background: '#000' }}
+                  />
+                ) : cameraSnapshotLargeUrl ? (
+                  <img
+                    key={cameraSnapshotLargeUrl}
+                    src={cameraSnapshotLargeUrl}
+                    alt={room.title + ' 实时快照'}
+                    className="h-full w-full object-contain"
+                    onError={() => {}}
+                  />
+                ) : (
+                  <div className="flex w-full flex-col items-center justify-center gap-2 py-6 text-center text-xs leading-5">
+                    {startStreamError ? (
+                      <div className="rounded border border-red-500/40 bg-red-950/30 px-3 py-2 text-red-200 break-all max-w-[90%]">
+                        {startStreamError}
+                      </div>
+                    ) : (
+                      <div className="text-slate-400">
+                        <div className="text-slate-200/80">暂无可渲染的画面</div>
+                        <div className="text-[10.5px] mt-0.5 text-slate-500">右上角「⚙ 设置」→ 接入账号或填快照 URL</div>
+                      </div>
+                    )}
+                    <Button
+                      size="sm"
+                      className={cn(
+                        'h-8 mt-1 text-[11px] bg-indigo-600 hover:bg-indigo-700',
+                        (!deviceDid || !canControl) && 'opacity-50 pointer-events-none',
+                      )}
+                      onClick={startCameraStream}
+                      disabled={openStreamLoading || !deviceDid || !canControl}
+                    >
+                      {openStreamLoading ? (
+                        <RefreshCw className="mr-1 h-3 w-3 animate-spin" />
+                      ) : (
+                        <CameraIcon className="mr-1 h-3 w-3" />
+                      )}
+                      {openStreamLoading ? '拉流中...' : '开启实时流'}
+                    </Button>
+                    {currentStream?.ffmpegAvailable === false ? (
+                      <div className="text-[10px] text-amber-400 mt-1 max-w-[90%]">
+                        ⚠ 服务器未检测到 ffmpeg，无法自动转码。
+                      </div>
+                    ) : null}
+                  </div>
+                )}
+                {currentStream?.hlsUrl ? (
+                  <div className="pointer-events-none absolute left-2 top-2 inline-flex items-center gap-1.5 rounded bg-black/60 px-2 py-1 text-[11px] font-medium text-emerald-100">
+                    <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
+                    LIVE · {currentStream.proxyMode || 'HLS'}
+                    {typeof currentStream.processId === 'number' ? ` · pid ${currentStream.processId}` : ''}
+                  </div>
+                ) : cameraSnapshotLargeUrl ? (
+                  <div className="pointer-events-none absolute left-2 top-2 inline-flex items-center gap-1.5 rounded bg-black/60 px-2 py-1 text-[11px] font-medium text-rose-100">
+                    <span className="h-2 w-2 rounded-full bg-rose-500 animate-pulse" />
+                    LIVE · 快照 10s 刷新
+                  </div>
+                ) : null}
               </div>
-              <div>
-                <Label className="text-[10.5px]">设备 IP</Label>
-                <Input
-                  value={controlLocalIp}
-                  onChange={(e) => setControlLocalIp(e.target.value)}
-                  placeholder="如 192.168.1.50"
-                  className="h-8 text-xs"
-                  disabled={!canControl}
-                />
+            </div>
+
+            <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 rounded-md border bg-slate-50 dark:bg-slate-900/40 px-3 py-2">
+              <div className="inline-flex flex-wrap items-center gap-1.5">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className={cn(
+                    'h-7 rounded-md px-2 text-[11px]',
+                    streamQuality === 'hd' ? 'bg-indigo-50 dark:bg-indigo-950/40 text-indigo-700 dark:text-indigo-300 border border-indigo-200/60 dark:border-indigo-800/50' : '',
+                  )}
+                  onClick={() => setStreamQuality('hd')}
+                >
+                  <Monitor className="mr-1 h-3.5 w-3.5" /> HD
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className={cn(
+                    'h-7 rounded-md px-2 text-[11px]',
+                    streamQuality === 'sd' ? 'bg-indigo-50 dark:bg-indigo-950/40 text-indigo-700 dark:text-indigo-300 border border-indigo-200/60 dark:border-indigo-800/50' : '',
+                  )}
+                  onClick={() => setStreamQuality('sd')}
+                >
+                  <Monitor className="mr-1 h-3.5 w-3.5" /> SD
+                </Button>
+                <div className="mx-1 h-4 w-px bg-slate-200 dark:bg-slate-700" />
+                <TooltipProvider delayDuration={150}>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        onClick={() => setCamSwitches((s) => ({ ...s, motion: !s.motion }))}
+                        className={cn(
+                          'inline-flex h-7 items-center gap-1 rounded-md border px-2 text-[10.5px] transition-colors',
+                          camSwitches.motion
+                            ? 'bg-emerald-50 dark:bg-emerald-950/40 border-emerald-400/60 text-emerald-700 dark:text-emerald-300'
+                            : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:border-slate-300',
+                        )}
+                      >
+                        <BellRing className="h-3.5 w-3.5" />
+                        人形侦测
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom" className="text-[11px]">
+                      {camSwitches.motion ? '已开启移动侦测推送' : '未开启移动侦测'}
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+                <TooltipProvider delayDuration={150}>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        onClick={() => setCamSwitches((s) => ({ ...s, night: !s.night }))}
+                        className={cn(
+                          'inline-flex h-7 items-center gap-1 rounded-md border px-2 text-[10.5px] transition-colors',
+                          camSwitches.night
+                            ? 'bg-indigo-950/80 dark:bg-indigo-950/60 border-indigo-400/60 text-indigo-100'
+                            : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:border-slate-300',
+                        )}
+                      >
+                        <Moon className="h-3.5 w-3.5" />
+                        夜视
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom" className="text-[11px]">
+                      {camSwitches.night ? '夜视模式 · 红外/全彩' : '自动切换夜视'}
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+                <TooltipProvider delayDuration={150}>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        onClick={() => setCamSwitches((s) => ({ ...s, audio: !s.audio }))}
+                        className={cn(
+                          'inline-flex h-7 items-center gap-1 rounded-md border px-2 text-[10.5px] transition-colors',
+                          camSwitches.audio
+                            ? 'bg-amber-50 dark:bg-amber-950/40 border-amber-400/60 text-amber-700 dark:text-amber-300'
+                            : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:border-slate-300',
+                        )}
+                      >
+                        {camSwitches.audio ? <Mic className="h-3.5 w-3.5" /> : <MicOff className="h-3.5 w-3.5" />}
+                        语音
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom" className="text-[11px]">
+                      {camSwitches.audio ? '对讲 / 语音已开启' : '关闭拾音与对讲'}
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+                <TooltipProvider delayDuration={150}>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        onClick={() => setCamSwitches((s) => ({ ...s, privacy: !s.privacy }))}
+                        className={cn(
+                          'inline-flex h-7 items-center gap-1 rounded-md border px-2 text-[10.5px] transition-colors',
+                          camSwitches.privacy
+                            ? 'bg-rose-50 dark:bg-rose-950/40 border-rose-400/60 text-rose-700 dark:text-rose-300'
+                            : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:border-slate-300',
+                        )}
+                      >
+                        {camSwitches.privacy ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                        遮挡
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom" className="text-[11px]">
+                      {camSwitches.privacy ? '物理遮挡 / 隐私模式' : '正常画面'}
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
               </div>
-              {controlProtocol === 'http' && (
-                <div className="space-y-1.5">
-                  <Input
-                    value={httpOnUrl}
-                    onChange={(e) => setHttpOnUrl(e.target.value)}
-                    placeholder="开命令 URL（如 http://ip/relay?state=1）"
-                    className="h-8 text-xs"
-                    disabled={!canControl}
-                  />
-                  <Input
-                    value={httpOffUrl}
-                    onChange={(e) => setHttpOffUrl(e.target.value)}
-                    placeholder="关命令 URL"
-                    className="h-8 text-xs"
-                    disabled={!canControl}
-                  />
-                  <Input
-                    value={httpStateUrl}
-                    onChange={(e) => setHttpStateUrl(e.target.value)}
-                    placeholder="状态 URL（返回 JSON，可选）"
-                    className="h-8 text-xs"
-                    disabled={!canControl}
-                  />
-                </div>
-              )}
-              {controlProtocol === 'modbus_tcp' && (
-                <div className="grid grid-cols-3 gap-2">
-                  <div>
-                    <Label className="text-[10.5px]">端口</Label>
-                    <Input value={modbusPort} onChange={(e) => setModbusPort(e.target.value)} className="h-8 text-xs" disabled={!canControl} />
-                  </div>
-                  <div>
-                    <Label className="text-[10.5px]">单元ID</Label>
-                    <Input value={modbusUnitId} onChange={(e) => setModbusUnitId(e.target.value)} className="h-8 text-xs" disabled={!canControl} />
-                  </div>
-                  <div>
-                    <Label className="text-[10.5px]">线圈地址</Label>
-                    <Input value={modbusCoilAddr} onChange={(e) => setModbusCoilAddr(e.target.value)} className="h-8 text-xs" disabled={!canControl} />
-                  </div>
-                </div>
-              )}
-              {controlTestResult && (
-                <div className="max-w-full break-all rounded bg-slate-100 px-2 py-1 text-[10.5px] text-slate-700 dark:bg-slate-800/60 dark:text-slate-200">
-                  {controlTestResult}
-                </div>
-              )}
-              <div className="flex flex-wrap items-center gap-1.5">
-                <Button size="sm" variant="outline" className="h-7 px-2 text-[11px]" onClick={() => handleTestControl('on')} disabled={controlTesting || !controlProtocol || !canControl}>
-                  测试开
+              <div className="inline-flex flex-wrap items-center gap-1.5">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 rounded-md px-2 text-[11px]"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setCameraSnapshotBump((prev) => prev + 1);
+                  }}
+                >
+                  <RefreshCw className="mr-1 h-3.5 w-3.5" /> 刷新快照
                 </Button>
-                <Button size="sm" variant="outline" className="h-7 px-2 text-[11px]" onClick={() => handleTestControl('off')} disabled={controlTesting || !controlProtocol || !canControl}>
-                  测试关
+                <Button
+                  size="sm"
+                  variant="default"
+                  className="h-7 rounded-md px-2 text-[11px] bg-indigo-600 hover:bg-indigo-700"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void handleTakeEvidenceSnapshot();
+                  }}
+                  disabled={takeSnapshotLoading || !deviceDid}
+                >
+                  {takeSnapshotLoading ? (
+                    <RefreshCw className="mr-1 h-3 w-3 animate-spin" />
+                  ) : (
+                    <Image className="mr-1 h-3.5 w-3.5" />
+                  )}
+                  临时截图
                 </Button>
-                <Button size="sm" variant="outline" className="h-7 px-2 text-[11px]" onClick={() => handleTestControl()} disabled={controlTesting || !controlProtocol || !canControl}>
-                  测试状态
-                </Button>
-                <Button size="sm" className="ml-auto h-7 px-2 text-[11px] bg-indigo-600 hover:bg-indigo-700" onClick={handleSaveControlConfig} disabled={controlSaving || !canControl}>
-                  {controlSaving ? '保存中...' : '保存配置'}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 rounded-md px-2 text-[11px]"
+                  onClick={startCameraStream}
+                  disabled={openStreamLoading}
+                >
+                  <RefreshCw className={cn('mr-1 h-3 w-3', openStreamLoading && 'animate-spin')} />
+                  重连流
                 </Button>
               </div>
             </div>
+
+            <div className="shrink-0 rounded-md border bg-slate-50 dark:bg-slate-900/40 p-2.5 flex flex-wrap items-center justify-center gap-5">
+              <div className="flex flex-col items-center justify-center">
+                <Badge variant="outline" className="mb-2 text-[10px] border-slate-300 text-slate-500">
+                  按下持续移动 · 松开停止
+                </Badge>
+                <div className="relative w-[232px] h-[232px] rounded-full border-2 border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950/80 shadow-inner">
+                  {([
+                    { key: 'up', x: 50, y: 8, dir: 'up' as const, label: '↑', disabled: false },
+                    { key: 'up-right', x: 84, y: 20, dir: 'up-right' as const, label: '↗', disabled: true },
+                    { key: 'right', x: 92, y: 50, dir: 'right' as const, label: '→', disabled: false },
+                    { key: 'down-right', x: 84, y: 80, dir: 'down-right' as const, label: '↘', disabled: true },
+                    { key: 'down', x: 50, y: 92, dir: 'down' as const, label: '↓', disabled: false },
+                    { key: 'down-left', x: 16, y: 80, dir: 'down-left' as const, label: '↙', disabled: true },
+                    { key: 'left', x: 8, y: 50, dir: 'left' as const, label: '←', disabled: false },
+                    { key: 'up-left', x: 16, y: 20, dir: 'up-left' as const, label: '↖', disabled: true },
+                  ] as const).map((p) => {
+                    const btnCls = cn(
+                      'absolute h-10 w-10 rounded-full text-lg font-bold transition-colors select-none -translate-x-1/2 -translate-y-1/2 flex items-center justify-center',
+                      p.disabled
+                        ? 'bg-slate-100 dark:bg-slate-800 text-slate-400 opacity-60 cursor-not-allowed'
+                        : 'bg-indigo-500 hover:bg-indigo-600 active:bg-indigo-700 text-white',
+                    );
+                    const diagsDisabled = p.disabled || !canControl || !deviceDid || ptzLoading;
+                    return (
+                      <button
+                        key={p.key}
+                        type="button"
+                        disabled={diagsDisabled}
+                        className={btnCls}
+                        style={{ left: `${p.x}%`, top: `${p.y}%` }}
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          if (p.disabled) return;
+                          if (p.dir.endsWith('left')) handleCameraPTZ('left');
+                          else if (p.dir.endsWith('right')) handleCameraPTZ('right');
+                          if (p.dir.startsWith('up')) handleCameraPTZ('up');
+                          else if (p.dir.startsWith('down')) handleCameraPTZ('down');
+                        }}
+                        onMouseUp={(e) => {
+                          e.preventDefault();
+                          if (p.disabled) return;
+                          handleCameraPTZ('stop');
+                        }}
+                        onMouseLeave={() => {
+                          if (p.disabled) return;
+                          handleCameraPTZ('stop');
+                        }}
+                        onTouchStart={(e) => {
+                          e.preventDefault();
+                          if (p.disabled) return;
+                          if (p.dir.endsWith('left')) handleCameraPTZ('left');
+                          else if (p.dir.endsWith('right')) handleCameraPTZ('right');
+                          if (p.dir.startsWith('up')) handleCameraPTZ('up');
+                          else if (p.dir.startsWith('down')) handleCameraPTZ('down');
+                        }}
+                        onTouchEnd={(e) => {
+                          e.preventDefault();
+                          if (p.disabled) return;
+                          handleCameraPTZ('stop');
+                        }}
+                      >
+                        {p.label}
+                      </button>
+                    );
+                  })}
+                  <button
+                    type="button"
+                    disabled={!canControl || !deviceDid || ptzLoading}
+                    className={cn(
+                      'absolute h-[96px] w-[96px] rounded-full text-sm font-bold transition-colors select-none -translate-x-1/2 -translate-y-1/2 flex flex-col items-center justify-center gap-0.5',
+                      'bg-indigo-700 hover:bg-indigo-800 active:bg-indigo-900 text-white shadow-md',
+                      (!canControl || !deviceDid) && 'opacity-60 cursor-not-allowed',
+                    )}
+                    style={{ left: '50%', top: '50%' }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleCameraPTZ('stop');
+                    }}
+                    title="回到居中位置"
+                  >
+                    <ShieldAlert className="h-4 w-4" />
+                    <span>居中</span>
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
-          <div className="space-y-2">
-            <Label>设备分类</Label>
-            <Select value={deviceCategoryDraft} onValueChange={setDeviceCategoryDraft} disabled={!canControl}>
-              <SelectTrigger className="w-full">
-                <SelectValue placeholder="选择分类" />
-              </SelectTrigger>
-              <SelectContent>
-                {(Object.values(DeviceCategory) as DeviceCategory[]).map((cat) => (
-                  <SelectItem key={cat} value={cat}>
-                    {DEVICE_CATEGORY_LABEL[cat] ?? cat}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="space-y-2">
-            <Label>设备名称</Label>
-            <Input
-              value={deviceNameDraft}
-              onChange={(event) => setDeviceNameDraft(event.target.value)}
-              placeholder="输入设备名称"
-              disabled={!canRename}
-              maxLength={32}
-            />
-          </div>
-        </div>
-        <DialogFooter>
-          <Button
-            variant="destructive"
-            onClick={handleDeleteDevice}
-            disabled={!canControl || deviceDeleting}
-            className="mr-auto"
-          >
-            {deviceDeleting ? '删除中...' : deviceDeleteConfirming ? '确认删除？' : '删除设备'}
-          </Button>
-          <Button variant="outline" onClick={() => setDeviceDetailOpen(false)} disabled={deviceCategorySaving || deviceNameSaving}>
-            取消
-          </Button>
-          <Button variant="outline" onClick={handleSaveDeviceName} disabled={!canRename || deviceNameSaving}>
-            {deviceNameSaving ? '保存中...' : '重命名'}
-          </Button>
-          <Button onClick={handleSaveDeviceCategory} disabled={!canControl || deviceCategorySaving}>
-            {deviceCategorySaving ? '保存中...' : '保存分类'}
-          </Button>
-        </DialogFooter>
+        )}
       </DialogContent>
     </Dialog>
-
 
     <Dialog
       open={networkDetailOpen}

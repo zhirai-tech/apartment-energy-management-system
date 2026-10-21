@@ -87,8 +87,7 @@ function pickModelText(modelValue: unknown): string {
   const raw = (typeof (obj as any)._raw === 'string' && (obj as any)._raw) ? String((obj as any)._raw) : '';
   const brand = (typeof obj.brand === 'string' && obj.brand) ? String(obj.brand) : '';
   const vendor = (typeof obj.vendorName === 'string' && obj.vendorName) ? String(obj.vendorName) : '';
-  const topModel = (typeof obj.model === 'string' && obj.model) ? String(obj.model) : '';
-  return camModel || cpeModel || wifiModel || brand || camBrand || vendor || topModel || raw || modelValue;
+  return camModel || cpeModel || wifiModel || brand || camBrand || vendor || raw || modelValue;
 }
 
 function normalizeVendorName(value: unknown): string | null {
@@ -610,8 +609,7 @@ export async function computeRoomRealtime(room: {
     const stale = lastSyncTs > 0 && (nowTs - lastSyncTs) > XIAOMI_STALE_OFFLINE_THRESHOLD_MS;
     let forceOffline = false;
     if (category === shared_types.DeviceCategory.CAMERA) {
-      // 仅对局域网/IP 摄像头按 lastSync 判定离线；米家云摄像头(isXiaomi)信任米家 API 写入的在线状态。
-      if (!isXiaomi && !isLanDiscovered && (!lastSyncTs || stale)) forceOffline = true;
+      if (!isLanDiscovered && (!lastSyncTs || stale)) forceOffline = true;
     }
     if (isXiaomi && !forceOffline) {
       const loggedIn = await xiaomiAdapter.isLoggedIn(scope).catch(() => false);
@@ -620,6 +618,15 @@ export async function computeRoomRealtime(room: {
     if (forceOffline && d.status !== 'offline') {
       d.status = 'offline';
     }
+    // #region debug-point B:energy-camera-status
+    if (category === shared_types.DeviceCategory.CAMERA) {
+      try {
+        const fs=require('fs'); let u='http://127.0.0.1:7778/event', s='camera-status-sync';
+        try { const e=fs.readFileSync('.dbg/camera-status-sync.env','utf8'); u=e.match(/DEBUG_SERVER_URL=(.+)/)?.[1]||u; s=e.match(/DEBUG_SESSION_ID=(.+)/)?.[1]||s; } catch {}
+        fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:s,runId:'pre-fix',hypothesisId:'B',location:'energy.service.ts:computeRoomRealtime',msg:'[DEBUG] energy camera status evaluated',data:{roomId:room.id,roomNumber:room.roomNumber,did:d.did,name:d.name,dbStatus:d.status,lastSyncAt:d.lastSyncAt?new Date(d.lastSyncAt).toISOString():null,scope,isXiaomi,stale,forceOffline}})}).catch(()=>{});
+      } catch {}
+    }
+    // #endregion
   }
   const onlineDevices = devices.filter((d: any) => d.status === 'online');
   const deviceOnline = onlineDevices.length > 0 || devices.length === 0;

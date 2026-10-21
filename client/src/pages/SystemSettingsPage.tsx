@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { Settings, Save, RefreshCw, Power, CheckCircle2, XCircle, LogIn, Shield, UserPlus, Trash2, HelpCircle, Plus, Loader2, CheckSquare, Square, Wifi } from 'lucide-react'
+import { Settings, Save, RefreshCw, Power, CheckCircle2, XCircle, LogIn, Shield, UserPlus, Trash2, HelpCircle, Plus, Loader2, CheckSquare, Square } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
@@ -24,9 +24,6 @@ import {
   DialogTitle,
 } from '../components/ui/dialog'
 import { DevicesTable } from '../components/device/DevicesTable'
-import { DeviceAddDialog } from '../components/device/DeviceAddDialog'
-import { LanScanHistoryCard } from '../components/settings/LanScanHistoryCard'
-import { RemoteAccessCard } from '../components/settings/RemoteAccessCard'
 import { SettingsParamsTab } from '../components/settings/SettingsParamsTab'
 import { auth, dashboard, energy, system } from '../lib/api'
 import { formatShortDateTime } from '../lib/format'
@@ -58,11 +55,10 @@ export function SystemSettingsPage() {
   const [formData, setFormData] = useState<Partial<SystemSettingsData>>({})
   const [saving, setSaving] = useState(false)
   const [bulkLimitSaving, setBulkLimitSaving] = useState(false)
-  const [addDeviceOpen, setAddDeviceOpen] = useState(false)
 
   const [xiaomiLogging, setXiaomiLogging] = useState(false)
-  const [xiaomiSyncing, setXiaomiSyncing] = useState(false)
-  const [localTokenSyncing, setLocalTokenSyncing] = useState(false)
+  const [, setXiaomiSyncing] = useState(false)
+  void setXiaomiSyncing
   const { credentials: xiaomiRemember, persist: persistXiaomiRemember, clear: clearXiaomiRemember } =
     useXiaomiRememberedCredentials('main')
   const { credentials: xiaomiExtraRemember, persist: persistXiaomiExtraRemember, clear: clearXiaomiExtraRemember } =
@@ -94,7 +90,6 @@ export function SystemSettingsPage() {
   const [apiSyncStatus, setApiSyncStatus] = useState('未连接')
   const lanDiscoveryMode = 'miot_lan' as const
   const [lanSubnet, setLanSubnet] = useState('')
-  const [lanSubnetsDetected, setLanSubnetsDetected] = useState<string[]>([])
   const [lanVendorRemoteApi, setLanVendorRemoteApi] = useState(true)
   const [lanScanning, setLanScanning] = useState(false)
   const [lanDiscoveryStatus, setLanDiscoveryStatus] = useState('未开始识别')
@@ -188,10 +183,9 @@ export function SystemSettingsPage() {
   const { data: xiaomiExtraStatus, refetch: refetchXiaomiExtraStatus } = useQuery({
     queryKey: ['xiaomi-camera-status'],
     queryFn: system.xiaomiCameraStatus,
-    // 该接口仅超级管理员可读，boss 角色不请求，避免 403 控制台噪音
-    enabled: canQueryProtectedApi && user?.role === UserRole.ADMIN,
+    enabled: canQueryProtectedApi && canManageXiaomi,
     retry: false,
-    refetchInterval: canQueryProtectedApi && user?.role === UserRole.ADMIN ? 15000 : false,
+    refetchInterval: canQueryProtectedApi && canManageXiaomi ? 15000 : false,
   })
 
   const { data: dashboardSummary } = useQuery<DashboardSummary>({
@@ -282,28 +276,6 @@ export function SystemSettingsPage() {
   useEffect(() => {
     setExtraVerificationPending(!!xiaomiExtraStatus?.auth?.needsVerification && !xiaomiExtraStatus?.loggedIn)
   }, [xiaomiExtraStatus?.auth?.needsVerification, xiaomiExtraStatus?.loggedIn])
-
-  useEffect(() => {
-    let cancelled = false
-    const detect = async () => {
-      try {
-        const res = await system.detectLanSubnets()
-        if (cancelled) return
-        const subnets = Array.isArray(res?.subnets) ? res.subnets : []
-        setLanSubnetsDetected(subnets)
-        // 只在用户尚未手动填写时，用自动探测结果预填（198 号段等现场网段）
-        if (subnets.length > 0) {
-          setLanSubnet((prev) => (prev.trim() ? prev : subnets.join(',')))
-        }
-      } catch {
-        // 静默失败，用户仍可手动填写
-      }
-    }
-    detect()
-    return () => {
-      cancelled = true
-    }
-  }, [])
 
   useEffect(() => {
     if (!verificationPending) return
@@ -1053,28 +1025,6 @@ export function SystemSettingsPage() {
     }
   }
 
-  /** 把米家云账号下设备的本地 token 同步到系统，配置成局域网直连 */
-  const handleSyncLocalBreakers = async () => {
-    setLocalTokenSyncing(true)
-    try {
-      const result = await system.syncXiaomiLocalBreakers()
-      if (result.updated > 0) {
-        toast.success(`已配置 ${result.updated}/${result.total} 台空开为局域网直连（之后断外网也能读数和控制）`)
-      } else {
-        toast.warning('没有可配置的设备，请先点「同步米家云设备」把设备同步进来')
-      }
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ['dashboard'] }),
-        queryClient.invalidateQueries({ queryKey: ['xiaomi-status'] }),
-      ])
-    } catch (error: unknown) {
-      const err = error as Error & { response?: { data?: { message?: string } } }
-      toast.error(err?.response?.data?.message || err?.message || '同步本地 Token 失败')
-    } finally {
-      setLocalTokenSyncing(false)
-    }
-  }
-
   const handleXiaomiSync = async () => {
     setXiaomiSyncing(true)
     try {
@@ -1473,16 +1423,11 @@ export function SystemSettingsPage() {
         <TabsList className="mb-2.5 h-auto w-full flex-wrap justify-start">
           <TabsTrigger value="params" className="text-xs sm:text-sm">系统参数</TabsTrigger>
           {canManageDevices && <TabsTrigger value="devices" className="text-xs sm:text-sm">设备总览</TabsTrigger>}
-          {canManageXiaomi && <TabsTrigger value="xiaomi" className="text-xs sm:text-sm">设备接入</TabsTrigger>}
+          {canManageXiaomi && <TabsTrigger value="xiaomi" className="text-xs sm:text-sm">设备同步</TabsTrigger>}
           {canManageUsers && <TabsTrigger value="accounts" className="text-xs sm:text-sm">账号管理</TabsTrigger>}
         </TabsList>
 
         <TabsContent value="params">
-          {canEdit && (
-            <div className="mb-3">
-              <RemoteAccessCard />
-            </div>
-          )}
           {isLoading ? (
             <div className="p-8 text-center text-muted-foreground">加载中...</div>
           ) : settings ? (
@@ -1549,95 +1494,26 @@ export function SystemSettingsPage() {
                   </TabsContent>
                 </Tabs>
 
-                <div className="flex flex-wrap items-center gap-2">
-                  <Button
-                    type="button"
-                    size="sm"
-                    onClick={() => setAddDeviceOpen(true)}
-                    title="添加设备：局域网扫描 / 米家云同步 / 手动添加"
-                  >
-                    <Plus className="mr-1.5 h-4 w-4" />
-                    添加设备
-                  </Button>
+                <div className="flex flex-wrap gap-2">
                   <Badge variant="success">在线 {dashboardSummary?.onlineDevices ?? 0}</Badge>
                   <Badge variant="danger">离线 {dashboardSummary?.offlineDevices ?? 0}</Badge>
                 </div>
               </div>
             </CardContent>
           </Card>
-          <div className="mt-3">
-            <LanScanHistoryCard
-              onChanged={() => {
-                void queryClient.invalidateQueries({ queryKey: ['dashboard'] })
-              }}
-            />
-          </div>
         </TabsContent>
         )}
 
         {canManageXiaomi && (
         <TabsContent value="xiaomi">
-          <Tabs defaultValue="cloud" className="space-y-3">
-            <TabsList className="grid w-full grid-cols-2">
-              <TabsTrigger value="cloud">米家云（账号 + 同步）</TabsTrigger>
-              <TabsTrigger value="local">本地局域网</TabsTrigger>
+          <Tabs defaultValue="account-sync" className="space-y-3">
+            <TabsList className="grid w-full grid-cols-3">
+              <TabsTrigger value="account-sync">账号同步</TabsTrigger>
+              <TabsTrigger value="api-sync">API 同步</TabsTrigger>
+              <TabsTrigger value="lan-discovery">本地识别</TabsTrigger>
             </TabsList>
 
-            <TabsContent value="cloud" className="mt-0 space-y-3">
-              <Card>
-                <CardContent className="space-y-3 p-4">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-sm font-medium">米家云账号</span>
-                    {accountStatusCards.map((item) => (
-                      <Badge
-                        key={item.scope}
-                        variant={item.loggedIn ? 'success' : item.lastResult === '需要安全验证' ? 'warning' : 'secondary'}
-                        className="gap-1 text-[11px]"
-                      >
-                        {item.title}
-                        {item.loggedIn
-                          ? `：已登录${item.username && item.username !== '-' ? `（${item.username}）` : ''}`
-                          : item.lastResult === '需要安全验证'
-                            ? '：需要验证'
-                            : '：未登录'}
-                      </Badge>
-                    ))}
-                    <div className="ml-auto flex flex-wrap items-center gap-2">
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="outline"
-                        onClick={handleSyncLocalBreakers}
-                        disabled={localTokenSyncing || !xiaomiStatus?.loggedIn}
-                        title="登录米家云后，把设备的本地 token 写入系统，之后空开走局域网直连（断外网可用）"
-                      >
-                        {localTokenSyncing ? (
-                          <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
-                        ) : (
-                          <Wifi className="mr-1.5 h-4 w-4" />
-                        )}
-                        同步空开本地 Token
-                      </Button>
-                      <Button
-                        type="button"
-                        size="sm"
-                        onClick={handleXiaomiSync}
-                        disabled={xiaomiSyncing || !(xiaomiStatus?.loggedIn || xiaomiExtraStatus?.loggedIn)}
-                      >
-                        {xiaomiSyncing ? (
-                          <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
-                        ) : (
-                          <RefreshCw className="mr-1.5 h-4 w-4" />
-                        )}
-                        同步米家云设备
-                      </Button>
-                    </div>
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    登录对应区域账号成功后，点右侧「同步米家云设备」即可把该账号下的设备同步进来。本地局域网设备不依赖此登录，断外网也能正常使用。
-                  </p>
-                </CardContent>
-              </Card>
+            <TabsContent value="account-sync" className="mt-0">
               <Card>
                 <CardHeader className="flex flex-row items-start justify-between space-y-0 pb-2">
                   <CardTitle className="text-lg flex items-center gap-2">
@@ -2025,7 +1901,9 @@ export function SystemSettingsPage() {
                   </div>
                 </CardContent>
               </Card>
-            <div className="border-t pt-3 text-sm font-medium text-muted-foreground">云端 API 接入（涂鸦云 / 阿里云 IoT 等，可选）</div>
+            </TabsContent>
+
+            <TabsContent value="api-sync" className="mt-0">
               <Card>
                 <CardHeader className="flex flex-row items-start justify-between space-y-0 pb-2">
                   <CardTitle className="text-lg">云厂商 API 同步</CardTitle>
@@ -2239,13 +2117,8 @@ export function SystemSettingsPage() {
               </Dialog>
             </TabsContent>
 
-            <TabsContent value="local" className="mt-0 space-y-3">
-              <LanScanHistoryCard
-                onChanged={() => {
-                  void queryClient.invalidateQueries({ queryKey: ['dashboard'] })
-                }}
-              />
-              <Card className="h-[calc(100vh-260px)] min-h-[420px] overflow-hidden">
+            <TabsContent value="lan-discovery" className="mt-0">
+              <Card className="h-[calc(100vh-260px)] overflow-hidden">
                 <CardHeader className="flex flex-row items-start justify-between space-y-0 pb-2">
                   <CardTitle className="text-lg">本地识别</CardTitle>
                   <Button
@@ -2270,18 +2143,6 @@ export function SystemSettingsPage() {
                         onChange={(e) => setLanSubnet(e.target.value)}
                         disabled={lanScanning}
                       />
-                      {lanSubnetsDetected.length > 0 && (
-                        <p className="text-[11px] leading-snug text-muted-foreground">
-                          已自动探测到本机所在网段：
-                          <button
-                            type="button"
-                            className="ml-1 font-mono text-primary underline-offset-2 hover:underline"
-                            onClick={() => setLanSubnet(lanSubnetsDetected.join(','))}
-                          >
-                            {lanSubnetsDetected.join(', ')}
-                          </button>
-                        </p>
-                      )}
                     </div>
                     <div className="flex items-center gap-2 pb-2">
                       <Switch
@@ -2671,15 +2532,6 @@ export function SystemSettingsPage() {
         )}
       </Tabs>
       )}
-
-      <DeviceAddDialog
-        open={addDeviceOpen}
-        onOpenChange={setAddDeviceOpen}
-        onAdded={async () => {
-          await queryClient.invalidateQueries({ queryKey: ['dashboard'] })
-          await queryClient.invalidateQueries({ queryKey: ['xiaomi-status'] })
-        }}
-      />
     </div>
   )
 }

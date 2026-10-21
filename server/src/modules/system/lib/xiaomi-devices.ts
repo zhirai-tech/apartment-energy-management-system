@@ -89,8 +89,6 @@ export interface DeviceRuntimePrevious {
   voltageV?: number | null;
   totalKwh?: number | null;
   power?: boolean | null;
-  status?: 'online' | 'offline' | 'unknown';
-  offlineSince?: Date | null;
 }
 
 const RANGE: {
@@ -292,7 +290,6 @@ import prisma from '../../../lib/prisma';
 import { writeOperation } from '../../../lib/logger';
 import type { OperationActorContext } from '../../../lib/operation-log';
 import { formatRoomDisplayName } from '../../../lib/room-display';
-import { resolveOfflineSince } from '../../../lib/device-runtime';
 
 export function resolveRoomIdForDevice(
   rooms: RoomLite[],
@@ -386,30 +383,6 @@ export function buildDeviceInfoItem(
   };
 }
 
-export function buildXiaomiModelMeta(device: XiaomiDeviceInfo): Record<string, unknown> {
-  const meta: Record<string, unknown> = {
-    model: device.model,
-    ownership: 'xiaomi',
-    source: 'account_sync',
-    sourceScope: device.sourceScope ?? 'main',
-    xiaomiDid: device.did,
-  };
-  if (device.sourceRegion) meta.sourceRegion = device.sourceRegion;
-  const localIp = typeof device.localIp === 'string' ? device.localIp.trim() : '';
-  if (localIp) meta.localIp = localIp;
-  return meta;
-}
-
-function parseLanModel(model: string | null): Record<string, unknown> | null {
-  if (!model) return null;
-  try {
-    const obj = JSON.parse(model);
-    return obj && typeof obj === 'object' ? (obj as Record<string, unknown>) : null;
-  } catch {
-    return null;
-  }
-}
-
 export async function syncXiaomiDevicesToDb(
   devices: XiaomiDeviceInfo[],
   operatorUserId: string | null,
@@ -433,82 +406,11 @@ export async function syncXiaomiDevicesToDb(
   }
   const roomSiteMap = new Map(rooms.map((room) => [room.id, room.siteId]));
 
-  // 预加载局域网设备，用于把米家云设备与局域网发现设备去重合并：
-  // 同一物理设备（米家摄像头等）会同时被局域网扫描(LAN_前缀)和米家 API 识别，
-  // 通过 localIp / 米家 did 关联到同一条记录，避免重复与状态冲突。
-  const lanDevices = await prisma.device.findMany({
-    where: { did: { startsWith: 'LAN_' } },
-    select: { did: true, name: true, model: true, siteId: true, powerW: true, currentA: true, voltageV: true, totalKwh: true, power: true, status: true, offlineSince: true },
-  });
-  const lanByIp = new Map<string, (typeof lanDevices)[number]>();
-  const lanByXiaomiDid = new Map<string, (typeof lanDevices)[number]>();
-  for (const ld of lanDevices) {
-    const parsed = parseLanModel(ld.model);
-    if (!parsed) continue;
-    const ip = typeof parsed.ipAddress === 'string' && parsed.ipAddress.trim() ? parsed.ipAddress.trim() : null;
-    if (ip) lanByIp.set(ip, ld);
-    const xd = typeof parsed.xiaomiDid === 'string' && parsed.xiaomiDid.trim() ? parsed.xiaomiDid.trim() : null;
-    if (xd) lanByXiaomiDid.set(xd, ld);
-  }
-  const claimedLanDid = new Set<string>();
-
   const now = new Date();
   for (const device of devices) {
-    const localIp = typeof device.localIp === 'string' ? device.localIp.trim() : '';
-
-    // 尝试关联已有的局域网设备（优先米家 did，其次 IP）
-    const matchedLan =
-      lanByXiaomiDid.get(device.did) ??
-      (localIp ? lanByIp.get(localIp) ?? null : null) ??
-      null;
-    const canClaim = matchedLan && !claimedLanDid.has(matchedLan.did) ? matchedLan : null;
-
-    if (canClaim) {
-      claimedLanDid.add(canClaim.did);
-      const lanParsed = parseLanModel(canClaim.model) ?? {};
-      const mergedModel = {
-        ...lanParsed,
-        ...buildXiaomiModelMeta(device),
-      };
-      const previous: DeviceRuntimePrevious | null = {
-        powerW: canClaim.powerW,
-        currentA: canClaim.currentA,
-        voltageV: canClaim.voltageV,
-        totalKwh: canClaim.totalKwh,
-        power: canClaim.power,
-      };
-      const safe = sanitizeRuntimeForUpsert(
-        {
-          powerW: device.powerW,
-          currentA: device.currentA,
-          voltageV: device.voltageV,
-          totalKwh: device.totalKwh,
-          online: device.online,
-        },
-        previous,
-      );
-      const mergedName = (typeof device.name === 'string' && device.name.trim() ? device.name.trim() : '') || canClaim.name;
-      await prisma.device.update({
-        where: { did: canClaim.did },
-        data: {
-          name: mergedName,
-          model: JSON.stringify(mergedModel),
-          status: safe.online ? DeviceStatus.online : DeviceStatus.offline,
-          offlineSince: resolveOfflineSince(canClaim.status, canClaim.offlineSince, safe.online === true),
-          power: safe.power,
-          powerW: safe.powerW,
-          currentA: safe.currentA,
-          voltageV: safe.voltageV,
-          totalKwh: safe.totalKwh,
-          lastSyncAt: now,
-        },
-      });
-      continue;
-    }
-
     const existing = await prisma.device.findUnique({
       where: { did: device.did },
-      select: { name: true, siteId: true, powerW: true, currentA: true, voltageV: true, totalKwh: true, power: true, status: true, offlineSince: true },
+      select: { name: true, siteId: true, powerW: true, currentA: true, voltageV: true, totalKwh: true, power: true },
     });
     const siteId =
       (device.roomId ? roomSiteMap.get(device.roomId) : null) ??
@@ -526,18 +428,15 @@ export async function syncXiaomiDevicesToDb(
       },
       previous,
     );
-    const modelJson = JSON.stringify(buildXiaomiModelMeta(device));
-    const offlineSince = resolveOfflineSince(existing?.status, existing?.offlineSince, safe.online === true);
 
     await prisma.device.upsert({
       where: { did: device.did },
       update: {
         siteId,
         name: existing?.name?.trim() || device.name,
-        model: modelJson,
+        model: device.model,
         roomId: device.roomId,
         status: safe.online ? DeviceStatus.online : DeviceStatus.offline,
-        offlineSince,
         power: safe.power,
         powerW: safe.powerW,
         currentA: safe.currentA,
@@ -549,10 +448,9 @@ export async function syncXiaomiDevicesToDb(
         did: device.did,
         siteId,
         name: device.name,
-        model: modelJson,
+        model: device.model,
         roomId: device.roomId ?? null,
         status: safe.online ? DeviceStatus.online : DeviceStatus.offline,
-        offlineSince,
         power: safe.power,
         powerW: safe.powerW,
         currentA: safe.currentA,

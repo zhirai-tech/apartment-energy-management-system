@@ -1,6 +1,6 @@
 {
   "name": "zhirai-apartment-energy-manager",
-  "version": "1.1.0",
+  "version": "1.0.0",
   "description": "ZHIRAI Apartment Energy Manager - Xiaomi Mi Home Apartment Intelligent Power Management System",
   "private": true,
   "workspaces": [

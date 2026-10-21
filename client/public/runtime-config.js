@@ -1,5 +1,5 @@
 window.__ZAEM_RUNTIME_CONFIG__ = {
-  apiBaseUrl: "/api",
-  socketUrl: "/",
-  socketPath: "/socket.io",
+  apiBaseUrl: "https://api.zhirai.cloud/zaem-api",
+  socketUrl: "https://api.zhirai.cloud",
+  socketPath: "/zaem-socket.io",
 };

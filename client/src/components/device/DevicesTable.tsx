@@ -11,7 +11,7 @@ import {
   TableRow,
 } from '../ui/table';
 import { toast } from 'sonner';
-import { Cpu, Pencil, Power, PowerOff } from 'lucide-react';
+import { Cpu, Pencil } from 'lucide-react';
 import * as api from '@/lib/api';
 import { useAuthStore } from '@/store/auth';
 import { UserRole, DeviceStatus as DS } from '@/types';
@@ -196,7 +196,7 @@ export function DevicesTable({ devices, invalidateOnChange, compact = false }: D
                         type="button"
                         onClick={() => onControl(d, 'on')}
                         disabled={d.status !== 'online'}
-                        title="通电 / 开启（合闸）" aria-label="通电开启"
+                        title="开启"
                         className={
                           'h-8 w-8 shrink-0 rounded-full border transition-colors ' +
                           (d.status === 'online'
@@ -205,13 +205,13 @@ export function DevicesTable({ devices, invalidateOnChange, compact = false }: D
                         }
                       >
                         <span className="sr-only">开启</span>
-                        <Power className="mx-auto h-[18px] w-[18px]" strokeWidth={2.6} />
+                        <div className="mx-auto h-2 w-2 rounded-full bg-white/80" />
                       </button>
                       <button
                         type="button"
                         onClick={() => onControl(d, 'off')}
                         disabled={d.status !== 'online'}
-                        title="断电 / 关闭（拉闸）" aria-label="断电关闭"
+                        title="关闭"
                         className={
                           'h-8 w-8 shrink-0 rounded-full border transition-colors ' +
                           (d.status === 'online'
@@ -219,7 +219,7 @@ export function DevicesTable({ devices, invalidateOnChange, compact = false }: D
                             : 'border-gray-300 bg-gray-100 text-gray-400 cursor-not-allowed')
                         }
                       >
-                        <span className="sr-only">关闭</span><PowerOff className="mx-auto h-[18px] w-[18px]" strokeWidth={2.6} />
+                        <span className="sr-only">关闭</span>
                       </button>
                     </div>
                   ) : null}
@@ -326,7 +326,7 @@ export function DevicesTable({ devices, invalidateOnChange, compact = false }: D
                             type="button"
                             onClick={() => onControl(d, 'on')}
                             disabled={d.status !== 'online'}
-                            title="通电 / 开启（合闸）" aria-label="通电开启"
+                            title="开启"
                             className={
                               'h-8 w-8 shrink-0 rounded-full border transition-colors ' +
                               (d.status === 'online'
@@ -335,13 +335,13 @@ export function DevicesTable({ devices, invalidateOnChange, compact = false }: D
                             }
                           >
                             <span className="sr-only">开启</span>
-                            <Power className="mx-auto h-[18px] w-[18px]" strokeWidth={2.6} />
+                            <div className="mx-auto h-2 w-2 rounded-full bg-white/80" />
                           </button>
                           <button
                             type="button"
                             onClick={() => onControl(d, 'off')}
                             disabled={d.status !== 'online'}
-                            title="断电 / 关闭（拉闸）" aria-label="断电关闭"
+                            title="关闭"
                             className={
                               'h-8 w-8 shrink-0 rounded-full border transition-colors ' +
                               (d.status === 'online'
@@ -349,7 +349,7 @@ export function DevicesTable({ devices, invalidateOnChange, compact = false }: D
                                 : 'border-gray-300 bg-gray-100 text-gray-400 cursor-not-allowed')
                             }
                           >
-                            <span className="sr-only">关闭</span><PowerOff className="mx-auto h-[18px] w-[18px]" strokeWidth={2.6} />
+                            <span className="sr-only">关闭</span>
                           </button>
                         </div>
                       </TableCell>

@@ -1,6 +1,5 @@
 import { useState, useEffect, type FormEvent, type ChangeEvent } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Input } from '../components/ui/input';
@@ -14,7 +13,6 @@ import type { LoginRequest } from '../types';
 export function LoginPage() {
   const navigate = useNavigate();
   const location = useLocation();
-  const queryClient = useQueryClient();
   const setAuth = useAuthStore((state) => state.setAuth);
   const logout = useAuthStore((state) => state.logout);
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
@@ -60,8 +58,6 @@ export function LoginPage() {
       const res = await auth.login(form);
       const credentials = remember ? { username: form.username, password: form.password } : undefined;
       setAuth(res.token, res.user, remember, credentials);
-      // 登录成功即清空查询缓存，确保进入首页时所有数据从服务器重新拉取最新值
-      queryClient.clear();
       try {
         if (remember) {
           localStorage.setItem('zaem_remember_me', '1');
@@ -80,11 +76,8 @@ export function LoginPage() {
       const from = (location.state as { from?: Location })?.from;
       navigate(from?.pathname ?? '/', { replace: true });
     } catch (err: unknown) {
-      const message =
-        err instanceof Error && err.message && err.message !== '请求失败'
-          ? err.message
-          : '登录失败';
-      toast.error(message);
+      const error = err as { response?: { data?: { message?: string } } };
+      toast.error(error?.response?.data?.message || '登录失败');
     } finally {
       setLoading(false);
     }

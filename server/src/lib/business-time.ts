@@ -47,7 +47,7 @@ export function normalizeBusinessTimeZone(timeZone?: string | null): string {
   }
 }
 
-function getZonedDateTimeParts(
+export function getZonedDateTimeParts(
   date: Date = new Date(),
   timeZone: string = DEFAULT_BUSINESS_TIMEZONE,
 ): ZonedDateTimeParts {
@@ -67,7 +67,7 @@ function getZonedDateTimeParts(
   };
 }
 
-function buildDayKey(year: number, month: number, day: number): string {
+export function buildDayKey(year: number, month: number, day: number): string {
   return `${year}-${pad(month)}-${pad(day)}`;
 }
 

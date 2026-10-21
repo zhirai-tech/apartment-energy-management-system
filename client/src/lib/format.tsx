@@ -146,39 +146,6 @@ export function hasMeaningfulValue(value: unknown): boolean {
   return !MEANINGLESS_TEXT_TOKENS.has(text);
 }
 
-// 根据设备名称/厂商/主机名/分类推断「这是台什么」，用于未分类设备卡片与详情，
-// 避免大面积显示「未知/未知终端」。
-export function inferEndpointTypeLabel(input: {
-  name?: string | null;
-  hostname?: string | null;
-  vendor?: string | null;
-  systemCategory?: string | null;
-  interfaceType?: string | null;
-}): string {
-  const category = String(input.systemCategory ?? '').trim();
-  if (category === 'camera') return '摄像头';
-  if (category === 'smart_appliance') return '智能设备';
-  if (category === 'circuit_breaker') return '智能空开';
-  if (category === 'wifi_ap') return '网关';
-  if (category === 'five_g_cpe') return '主路由';
-
-  const text = [
-    input.name ?? '',
-    input.hostname ?? '',
-    input.vendor ?? '',
-    input.interfaceType ?? '',
-  ].join(' ').toLowerCase();
-  if (/(iphone|android|poco|redmi|xiaomi|mi phone|huawei|honor|oppo|vivo|oneplus|realme|galaxy|samsung)/.test(text)) return '手机';
-  if (/(ipad|tablet|tab\b|mi pad|matepad|xiaoxin pad)/.test(text)) return '平板';
-  if (/(macbook|notebook|laptop|desktop|thinkpad|surface|windows|pc\b|lenovo|dell|hp\b|asus|acer|msi)/.test(text)) return '电脑';
-  if (/(amazon|echo|alexa|homepod|google home|nest)/.test(text)) return '音箱';
-  if (/(tv|bravia|hisense|tcl|xiaomi tv|appletv|apple tv|webos)/.test(text)) return '电视';
-  if (/(printer|epson|canon|brother|hp laser|打印机)/.test(text)) return '打印机';
-  if (/(switch|breaker|relay|lxzn|miot|tuya|iot|sensor|plug|air purifier|vacuum)/.test(text)) return 'IoT 设备';
-  if (/(beacon|router|mesh|h122|gateway|网关|路由)/.test(text)) return '网络设备';
-  return '未知终端';
-}
-
 export const CATEGORY_ICON_MAP: Record<DeviceCategory, LucideIcon> = {
   [DeviceCategory.CIRCUIT_BREAKER]: Power,
   [DeviceCategory.CAMERA]: Camera,

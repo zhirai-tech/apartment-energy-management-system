@@ -13,12 +13,8 @@ import { EnergyLimitsPage } from './pages/EnergyLimitsPage';
 import { SystemSettingsPage } from './pages/SystemSettingsPage';
 import { OperationLogsPage } from './pages/OperationLogsPage';
 import { AlarmCenterPage } from './pages/AlarmCenterPage';
-import { RecordingsPage } from './pages/RecordingsPage';
-import { CameraWallPage } from './pages/CameraWallPage';
 import { ForcePasswordChangePage } from './pages/ForcePasswordChangePage';
 import { NetworkDevicePage } from './pages/NetworkDevicePage';
-import { NetworkDevicesPage } from './pages/NetworkDevicesPage';
-import { ExportPage } from './pages/ExportPage';
 
 function App() {
   return (
@@ -48,12 +44,9 @@ function App() {
             <Route path="rooms/:roomId" element={<RoomDetailPage />} />
             <Route path="energy-limits" element={<EnergyLimitsPage />} />
             <Route path="system" element={<SystemSettingsPage />} />
-            <Route path="network-devices" element={<NetworkDevicesPage />} />`r`n            <Route path="network-devices/:did" element={<NetworkDevicePage />} />
+            <Route path="network-devices/:did" element={<NetworkDevicePage />} />
             <Route path="logs/operations" element={<OperationLogsPage />} />
             <Route path="logs/alarms" element={<AlarmCenterPage />} />
-            <Route path="recordings" element={<RecordingsPage />} />
-            <Route path="cameras" element={<CameraWallPage />} />
-            <Route path="export" element={<ExportPage />} />
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
