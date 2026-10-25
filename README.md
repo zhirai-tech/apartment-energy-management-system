@@ -8,6 +8,13 @@
 
 # ZHIRAI Apartment Energy Manager
 
+## Screenshots / 截图
+
+![ZAEM energy dashboard](docs/images/zhirai-dashboard-overview.png)
+
+*Apartment energy dashboard from the project documentation. / 项目文档中的公寓能源管理面板。*
+
+
 ZHIRAI Apartment Energy Manager is a centralized web platform for apartment, dormitory, rental, and multi-room electricity management. It connects Xiaomi / Mi Home power control devices and turns scattered device status, real-time power, daily consumption, historical energy, alerts, manual cut-off, and automatic restore flows into a single operational dashboard.
 
 In practical terms, the project is built to solve these problems:
