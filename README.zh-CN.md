@@ -1,4 +1,4 @@
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md) | [简体中文](README.zh-CN.md) | [个人网站](https://zhinian-ai.com)
 
 # 公寓能源管理系统
 
@@ -7,3 +7,9 @@
 ## 许可证
 
 MIT License；再分发保留 LICENSE 和 NOTICE。第三方组件继续适用其原始许可。
+
+---
+
+## 个人网站
+
+**ZHIRAI / 智睿科技** — [zhinian-ai.com](https://zhinian-ai.com)
