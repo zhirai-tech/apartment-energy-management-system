@@ -1,4 +1,4 @@
-# ZAEM Apartment Energy Manager
+# Apartment Energy Management System
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
