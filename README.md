@@ -1,3 +1,11 @@
+> **简体中文 | English**
+>
+> ZAEM 公寓能源管理器：面向公寓、宿舍、出租房和多房间场景的用电集中管理平台，接入小米/米家电源控制设备，展示实时功率、每日用电、历史能耗、告警、手动断电和自动恢复。
+>
+> **ZAEM Apartment Energy Manager** is a centralized electricity management platform for apartments, dormitories, rentals and multi-room buildings. It connects Xiaomi/Mi Home power-control devices and covers live power, daily usage, history, alerts, manual cut-off and automatic restore.
+
+---
+
 # ZHIRAI Apartment Energy Manager
 
 ZHIRAI Apartment Energy Manager is a centralized web platform for apartment, dormitory, rental, and multi-room electricity management. It connects Xiaomi / Mi Home power control devices and turns scattered device status, real-time power, daily consumption, historical energy, alerts, manual cut-off, and automatic restore flows into a single operational dashboard.
